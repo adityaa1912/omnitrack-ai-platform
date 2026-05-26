@@ -1,112 +1,323 @@
 # OmniTrack AI Platform
 
-👁️ Real-time object detection and tracking built as a production-ready system, not just a standalone script.
+<p align="center">
+  <b>Production-grade real-time object detection and tracking platform built using YOLOv8, modular AI inference pipelines, and scalable distributed system architecture.</b>
+</p>
 
-OmniTrack is a practical, modular AI surveillance pipeline designed to process real-time video streams. Instead of jamming everything into a single file, this project is built from the ground up using a clean architecture that separates frame ingestion, model inference, and rendering. This makes it easy to transition from a local webcam setup to a distributed, production system.
+<p align="center">
 
-[Features](#-features) •
-[Architecture](#-system-architecture) •
-[Getting Started](#-getting-started) •
-[Benchmarks](#-benchmarks) •
-[Roadmap](#-roadmap)
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![YOLOv8](https://img.shields.io/badge/YOLOv8-Ultralytics-green)
+![OpenCV](https://img.shields.io/badge/OpenCV-ComputerVision-red)
+![Status](https://img.shields.io/badge/Status-ActiveDevelopment-orange)
 
----
-
-## 🔥 Features
-
-### What's working right now:
-* **Clean, Modular Code:** Separate files/layers for configuration, data types, frame ingestion, detection, and rendering.
-* **YOLOv8 Live Pipeline:** Streamlined integration with Ultralytics YOLOv8 for object detection and confidence scoring.
-* **Safe Resource Cleanup:** Handles application shutdowns (`Ctrl+C` or `q`) cleanly without leaving hanging webcam processes or thread leaks.
-* **Structured Logging:** No messy `print()` statements. Uses centralized logging to track performance metrics and FPS in real time.
-
-### What's coming next:
-* State persistence using **ByteTrack** / **BoT-SORT** to track objects across frames with unique IDs.
-* **Apache Kafka** pipeline to handle multiple video streams concurrently without choking the main ML model.
-* High-performance deployment using **FastAPI** and **TensorRT** acceleration.
+</p>
 
 ---
 
-## 🏗️ System Architecture
+# 👁️ Overview
 
-The data flows through the application linearly, ensuring that adding tracking logic or database writes won't block the video frame capture thread.
+OmniTrack is a modular AI-powered surveillance and analytics platform designed for real-time object detection, tracking, and scalable distributed inference.
+
+Unlike basic demo scripts, this project is engineered as a production-oriented AI infrastructure system with clean architecture, abstraction layers, extensibility, and deployment readiness.
+
+The platform is being developed incrementally toward:
+- multi-object tracking
+- distributed stream ingestion
+- scalable inference orchestration
+- GPU acceleration
+- Kubernetes-native deployment
+
+---
+
+# 🚀 Features
+
+## ✅ Currently Implemented
+
+- Real-time YOLOv8 object detection
+- Webcam video stream inference
+- Bounding box rendering
+- Confidence score visualization
+- FPS monitoring
+- Structured logging system
+- Graceful shutdown handling
+- Modular architecture
+- Production-style code organization
+- Type-safe dataclass-driven pipeline
+
+---
+
+## 🔥 Planned Features
+
+- ByteTrack / BoT-SORT integration
+- Persistent object IDs
+- Multi-object trajectory analysis
+- RTSP stream ingestion
+- Multi-stream concurrent inference
+- Kafka-based distributed ingestion
+- FastAPI inference APIs
+- Redis state synchronization
+- TensorRT optimization
+- Kubernetes deployment
+- Distributed GPU workers
+- Prometheus/Grafana monitoring
+
+---
+
+# 🏗️ System Architecture
+
+The system separates:
+- frame ingestion
+- model inference
+- tracking
+- visualization
+- orchestration
+
+This ensures future scalability without major architectural rewrites.
 
 ```text
-  [ Webcam / RTSP Stream ]
-              │
-              ▼
-    ┌───────────────────┐
-    │   Frame Ingestion │  <-- OpenCV thread capturing raw frames
-    └───────────────────┘
-              │
-              ▼
-    ┌───────────────────┐
-    │   YOLOv8 Engine   │  <-- Object detection & tensor processing
-    └───────────────────┘
-              │
-              ▼
-    ┌───────────────────┐
-    │   Tracking Layer  │  <-- (Phase 2: Assigning IDs to objects)
-    └───────────────────┘
-              │
-              ▼
-    ┌───────────────────┐
-    │    Visualizer     │  <-- Drawing bounding boxes & performance text
-    └───────────────────┘
+         [ Webcam / RTSP Stream ]
+                     │
+                     ▼
+        ┌────────────────────────┐
+        │   Frame Ingestion      │
+        │   OpenCV Video Layer   │
+        └────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────┐
+        │    YOLOv8 Engine       │
+        │ Detection & Inference  │
+        └────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────┐
+        │   Tracking Layer       │
+        │ ByteTrack / BoT-SORT   │
+        └────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────┐
+        │     Visualization      │
+        │ Rendering + Metrics    │
+        └────────────────────────┘
+                     │
+                     ▼
+        ┌────────────────────────┐
+        │ Future Distributed     │
+        │ Services & APIs        │
+        └────────────────────────┘
+```
 
-📂 Project LayoutPlaintextomnitrack-ai-platform/
-├── inference/                  # All core backend logic lives here
-│   ├── main.py                 # Application launcher
-│   ├── detector.py             # YOLOv8 wrapper & model inference
-│   ├── frame_source.py         # Handles camera/video input streams
-│   ├── visualizer.py           # Handles UI rendering and text overlays
-│   ├── config.py               # Global settings & app configurations
-│   ├── logger.py               # Custom structured logger
-│   ├── types.py                # Type hinting and custom dataclasses
+---
+
+# 📂 Project Structure
+
+```text
+omnitrack-ai-platform/
+│
+├── inference/
+│   ├── main.py
+│   ├── detector.py
+│   ├── frame_source.py
+│   ├── visualizer.py
+│   ├── config.py
+│   ├── logger.py
+│   ├── types.py
 │   └── __init__.py
-├── PROJECT_DOCS/               # Deep dives into system design
+│
+├── PROJECT_DOCS/
 │   ├── SYSTEM_ARCHITECTURE.md
 │   ├── BENCHMARKS.md
 │   ├── ROADMAP.md
 │   └── INTERVIEW_QA.md
-├── docker-compose.yml          # Container configuration
-├── requirements.txt            # Project dependencies
+│
+├── docker-compose.yml
+├── requirements.txt
+├── .gitignore
 └── README.md
+```
 
-📊 BenchmarksCurrent baseline metrics running on a local setup. For deep dives, check out BENCHMARKS.md.MetricSpecs / PerformanceModelYOLOv8n (Nano)Inference DeviceCPUAverage Speed~9 - 10 FPSLatency~154msDependenciesUltralytics,
-OpenCV💡 Note: Running on CPU is a bottleneck. Moving inference to an NVIDIA GPU with TensorRT optimization (Phase 5) will drop latency down to single-digit milliseconds.
-🛠️ Getting Started
-Prerequisites
-Python 3.10 or higher
-A working webcam or an RTSP video link1. Clone the projectBashgit clone [https://github.com/adityaa1912/omnitrack-ai-platform.git](https://github.com/adityaa1912/omnitrack-ai-platform.git)
+---
+
+# 📊 Performance Benchmarks
+
+| Metric | Value |
+|---|---|
+| Model | YOLOv8n |
+| Inference Device | CPU |
+| Average FPS | ~9-10 FPS |
+| Inference Latency | ~154ms |
+| Framework | Ultralytics + OpenCV |
+
+> ⚠️ Current inference is CPU-bound. Future GPU acceleration using TensorRT and CUDA optimization is planned.
+
+---
+
+# 🛠️ Getting Started
+
+## Prerequisites
+
+- Python 3.10+
+- Webcam or RTSP stream
+- Git installed
+
+---
+
+## 1️⃣ Clone Repository
+
+```bash
+git clone https://github.com/adityaa1912/omnitrack-ai-platform.git
 cd omnitrack-ai-platform
-2. Set up a virtual environmentBash# Create it
+```
+
+---
+
+## 2️⃣ Create Virtual Environment
+
+```bash
 python -m venv venv
+```
 
-# Windows activate:
+---
+
+## 3️⃣ Activate Environment
+
+### Windows
+
+```bash
 venv\Scripts\activate
+```
 
-# Mac/Linux activate:
+### Linux / Mac
+
+```bash
 source venv/bin/activate
-3. Install dependenciesBashpip install --upgrade pip
+```
+
+---
+
+## 4️⃣ Install Dependencies
+
+```bash
+pip install --upgrade pip
 pip install -r requirements.txt
-4. Run the codeBashpython -m inference.main
-Press q while focusing on the video window to exit the program safely.
-🛠️ Tech Stack
-Core AI: YOLOv8, PyTorch
-Computer Vision: OpenCV
-Backend API (Planned): FastAPI, Uvicorn
-Data Ingestion (Planned): Apache Kafka
-Caching (Planned): Redis
-DevOps (Planned): Docker, Kubernetes, Prometheus, Grafana
-🗺️ RoadmapPhase
-1: Core Foundation [DONE][x] Write modular, clean code structure instead of a single massive file[x] Real-time video window rendering with live FPS counter[x] Fix resource cleanup hooks to prevent system crashes on exitPhase
-2: Tracking and Streams [IN PROGRESS][ ] Add ByteTrack and BoT-SORT algorithms[ ] Support tracking the paths of objects over time[ ] Run inference on multiple video inputs at the same timePhase
-3: API & Web Tier[ ] Wrap the pipeline in FastAPI[ ] Send bounding box coordinate data via WebSockets as raw JSONPhase
-4: Scaling Up[ ] Put a Kafka broker in front of the pipeline to buffer video frames[ ] Use Redis to sync object tracker states across multiple workersPhase
-5: Hardware Optimization[ ] Convert the PyTorch weights to TensorRT execution engines for fast GPU inference[ ] Package everything into Kubernetes manifests with resource scaling rules👤
-Author
-Aditya Mengawade
-GitHub: @adityaa1912
-📄License
-This project is currently under active development. All rights reserved.
+```
+
+---
+
+## 5️⃣ Run the Inference Pipeline
+
+```bash
+python -m inference.main
+```
+
+Press:
+
+```text
+q
+```
+
+to exit safely.
+
+---
+
+# 🛠️ Technology Stack
+
+| Layer | Technologies |
+|---|---|
+| AI/ML | YOLOv8, PyTorch |
+| Computer Vision | OpenCV |
+| Backend (Planned) | FastAPI |
+| Streaming (Planned) | Apache Kafka |
+| Caching (Planned) | Redis |
+| Deployment (Planned) | Docker, Kubernetes |
+| Monitoring (Planned) | Prometheus, Grafana |
+
+---
+
+# 🎯 Engineering Goals
+
+- Modular architecture
+- Low-latency inference
+- Scalable distributed design
+- Production-oriented maintainability
+- Multi-stream processing support
+- GPU acceleration readiness
+- Clean observability and monitoring
+
+---
+
+# 🗺️ Development Roadmap
+
+## ✅ Phase 1: Core Detection Pipeline
+
+- [x] Modular inference architecture
+- [x] Real-time webcam inference
+- [x] FPS monitoring
+- [x] Structured logging
+- [x] Graceful shutdown handling
+
+---
+
+## 🚧 Phase 2: Multi-Object Tracking
+
+- [ ] ByteTrack integration
+- [ ] Persistent tracking IDs
+- [ ] Trajectory rendering
+- [ ] Object lifecycle management
+
+---
+
+## 🔌 Phase 3: API & Streaming Layer
+
+- [ ] FastAPI inference server
+- [ ] WebSocket streaming
+- [ ] Async processing pipeline
+
+---
+
+## 🌐 Phase 4: Distributed Infrastructure
+
+- [ ] Kafka ingestion pipeline
+- [ ] Redis synchronization
+- [ ] Multi-stream orchestration
+- [ ] Distributed worker system
+
+---
+
+## ⚡ Phase 5: Hardware Optimization
+
+- [ ] TensorRT conversion
+- [ ] CUDA acceleration
+- [ ] GPU inference workers
+- [ ] Kubernetes deployment
+
+---
+
+# 📈 Future Enterprise Use Cases
+
+- Smart surveillance systems
+- Traffic analytics
+- Retail customer analytics
+- Industrial safety monitoring
+- Crowd anomaly detection
+- Smart city orchestration
+- Warehouse automation
+
+---
+
+# 👨‍💻 Author
+
+**Aditya Mengawade**
+
+GitHub:  
+https://github.com/adityaa1912
+
+---
+
+# 📄 License
+
+This project is currently under active development.
+
+All rights reserved.
