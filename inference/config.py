@@ -24,6 +24,10 @@ class FrameSourceConfig:
     fps: int = 30
     retry_attempts: int = 3
     retry_delay_sec: float = 5.0
+    stream_timeout_sec: float = 10.0  # RTSP stream health check timeout
+    backoff_initial_sec: float = 1.0  # Initial reconnection delay
+    backoff_max_sec: float = 30.0  # Maximum reconnection delay
+    backoff_factor: float = 2.0  # Exponential multiplier for backoff
 
 
 @dataclass
@@ -109,6 +113,32 @@ class AppConfig:
             help="Target FPS (default: 30)",
         )
 
+        # Stream source options (RTSP/video file)
+        parser.add_argument(
+            "--stream-timeout",
+            type=float,
+            default=10.0,
+            help="RTSP stream idle timeout for reconnection (seconds, default: 10.0)",
+        )
+        parser.add_argument(
+            "--backoff-initial",
+            type=float,
+            default=1.0,
+            help="Initial RTSP reconnection delay (seconds, default: 1.0)",
+        )
+        parser.add_argument(
+            "--backoff-max",
+            type=float,
+            default=30.0,
+            help="Maximum RTSP reconnection delay (seconds, default: 30.0)",
+        )
+        parser.add_argument(
+            "--backoff-factor",
+            type=float,
+            default=2.0,
+            help="RTSP reconnection backoff multiplier (default: 2.0 = exponential)",
+        )
+
         # Visualizer options
         parser.add_argument(
             "--line-thickness",
@@ -185,6 +215,10 @@ class AppConfig:
             width=args.width,
             height=args.height,
             fps=args.fps,
+            stream_timeout_sec=args.stream_timeout,
+            backoff_initial_sec=args.backoff_initial,
+            backoff_max_sec=args.backoff_max,
+            backoff_factor=args.backoff_factor,
         )
 
         visualizer_config = VisualizerConfig(
