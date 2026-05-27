@@ -23,6 +23,7 @@ from .config import AppConfig
 from .detector import Detector
 from .frame_source import WebcamFrameSource
 from .logger import get_logger, setup_logging
+from .tracker import CentroidTracker
 from .visualizer import FpsCounter, Visualizer
 
 
@@ -95,6 +96,13 @@ def main() -> int:
                 visualizer = Visualizer(config.visualizer_config)
                 fps_counter = FpsCounter()
 
+                tracker = None
+                if config.tracking_config.enabled:
+                    tracker = CentroidTracker(config.tracking_config)
+                    logger.info("Multi-object tracking enabled")
+                else:
+                    logger.info("Multi-object tracking disabled")
+
                 logger.info("Pipeline ready. Starting inference...")
                 logger.info("Press 'q' to quit or Ctrl+C for graceful shutdown")
 
@@ -112,12 +120,27 @@ def main() -> int:
                         fps_counter.update(result.inference_time_ms)
                         frame_count += 1
 
-                        # Render results
-                        output_frame = visualizer.render(
-                            frame.data,
-                            result,
-                            fps=fps_counter.fps,
-                        )
+                        # Run tracking if enabled
+                        if tracker is not None:
+                            tracking_result = tracker.update(
+                                result.detections,
+                                frame.frame_id,
+                                frame.timestamp,
+                            )
+
+                            # Render tracked results
+                            output_frame = visualizer.render_tracked(
+                                frame.data,
+                                tracking_result,
+                                fps=fps_counter.fps,
+                            )
+                        else:
+                            # Render detection-only results
+                            output_frame = visualizer.render(
+                                frame.data,
+                                result,
+                                fps=fps_counter.fps,
+                            )
 
                         # Display frame
                         cv2.imshow("YOLOv8 Detection", output_frame)
@@ -130,12 +153,21 @@ def main() -> int:
 
                         # Log periodic stats
                         if frame_count % 100 == 0:
-                            logger.info(
-                                f"Processed {frame_count} frames | "
-                                f"FPS: {fps_counter.fps:.1f} | "
-                                f"Inference: {result.inference_time_ms:.1f}ms | "
-                                f"Detections: {result.num_detections}"
-                            )
+                            if tracker is not None:
+                                logger.info(
+                                    f"Processed {frame_count} frames | "
+                                    f"FPS: {fps_counter.fps:.1f} | "
+                                    f"Inference: {result.inference_time_ms:.1f}ms | "
+                                    f"Tracks: {tracking_result.active_tracks} | "
+                                    f"Detections: {result.num_detections}"
+                                )
+                            else:
+                                logger.info(
+                                    f"Processed {frame_count} frames | "
+                                    f"FPS: {fps_counter.fps:.1f} | "
+                                    f"Inference: {result.inference_time_ms:.1f}ms | "
+                                    f"Detections: {result.num_detections}"
+                                )
 
                 except KeyboardInterrupt:
                     logger.info("Interrupted")

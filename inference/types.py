@@ -25,6 +25,7 @@ class Detection:
     class_id: int
     confidence: float
     class_name: str
+    track_id: Optional[int] = None
 
     def center(self) -> tuple[float, float]:
         """Return bounding box center (x, y)."""

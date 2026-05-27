@@ -3,6 +3,8 @@ import argparse
 import logging
 from pathlib import Path
 
+from .tracking_config import TrackingConfig
+
 
 @dataclass
 class DetectorConfig:
@@ -31,6 +33,8 @@ class VisualizerConfig:
     show_confidence: bool = True
     line_thickness: int = 2
     font_scale: float = 0.6
+    show_trajectories: bool = True
+    trajectory_thickness: int = 2
     class_colors: dict[int, tuple[int, int, int]] = field(default_factory=dict)
 
 
@@ -40,6 +44,7 @@ class AppConfig:
     detector_config: DetectorConfig = field(default_factory=DetectorConfig)
     frame_source_config: FrameSourceConfig = field(default_factory=FrameSourceConfig)
     visualizer_config: VisualizerConfig = field(default_factory=VisualizerConfig)
+    tracking_config: TrackingConfig = field(default_factory=TrackingConfig)
     log_level: str = "INFO"
     debug: bool = False
     graceful_shutdown_timeout_sec: float = 5.0
@@ -128,6 +133,30 @@ class AppConfig:
             help="Hide FPS counter in output",
         )
 
+        # Tracking options
+        parser.add_argument(
+            "--no-tracking",
+            action="store_true",
+            help="Disable multi-object tracking",
+        )
+        parser.add_argument(
+            "--track-dist",
+            type=float,
+            default=50.0,
+            help="Centroid distance threshold for matching (pixels, default: 50.0)",
+        )
+        parser.add_argument(
+            "--max-age",
+            type=int,
+            default=30,
+            help="Frames before deleting lost tracks (default: 30)",
+        )
+        parser.add_argument(
+            "--no-trajectories",
+            action="store_true",
+            help="Hide trajectory paths in output",
+        )
+
         # Application options
         parser.add_argument(
             "--log-level",
@@ -163,12 +192,21 @@ class AppConfig:
             show_confidence=not args.no_conf,
             line_thickness=args.line_thickness,
             font_scale=args.font_scale,
+            show_trajectories=not args.no_trajectories,
+            trajectory_thickness=args.line_thickness,
+        )
+
+        tracking_config = TrackingConfig(
+            enabled=not args.no_tracking,
+            centroid_distance_threshold=args.track_dist,
+            max_age=args.max_age,
         )
 
         return AppConfig(
             detector_config=detector_config,
             frame_source_config=frame_source_config,
             visualizer_config=visualizer_config,
+            tracking_config=tracking_config,
             log_level=args.log_level,
             debug=args.debug,
         )

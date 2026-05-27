@@ -6,6 +6,7 @@ import numpy as np
 
 from .config import VisualizerConfig
 from .types import Detection, InferenceResult
+from .tracking_types import TrackedObject, TrackingResult
 
 
 logger = logging.getLogger(__name__)
@@ -212,3 +213,151 @@ class Visualizer:
                 class_id % len(self.DEFAULT_COLORS)
             ]
         return self.colors[class_id]
+
+    def render_tracked(
+        self,
+        frame: np.ndarray,
+        tracking_result: TrackingResult,
+        fps: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Render tracked objects with IDs and trajectories.
+
+        Args:
+            frame: Input image array (H, W, 3)
+            tracking_result: Tracking result with tracked objects
+            fps: Current FPS for overlay (optional)
+
+        Returns:
+            Frame with tracked objects, IDs, trajectories, and FPS counter
+        """
+        output = frame.copy()
+
+        # Draw trajectories first (background)
+        if self.config.show_trajectories:
+            for tracked_obj in tracking_result.tracked_objects:
+                self._draw_trajectory(output, tracked_obj)
+
+        # Draw detections with track IDs
+        for tracked_obj in tracking_result.tracked_objects:
+            detection = tracked_obj.current_detection
+            if detection is not None:
+                self._draw_tracked_detection(output, detection, tracked_obj.track_id)
+
+        if self.config.show_fps and fps is not None:
+            self._draw_fps(output, fps)
+
+        self._draw_tracking_stats(output, tracking_result)
+
+        return output
+
+    def _draw_tracked_detection(
+        self,
+        frame: np.ndarray,
+        detection: Detection,
+        track_id: int,
+    ) -> None:
+        """Draw bounding box with tracking ID."""
+        x1, y1, x2, y2 = int(detection.x1), int(detection.y1), int(detection.x2), int(detection.y2)
+        color = self._get_color(detection.class_id)
+
+        cv2.rectangle(
+            frame,
+            (x1, y1),
+            (x2, y2),
+            color,
+            self.config.line_thickness,
+        )
+
+        label = f"ID:{track_id} {detection.class_name}"
+        if self.config.show_confidence:
+            label += f" {detection.confidence:.2f}"
+
+        font_scale = self.config.font_scale
+        font_thickness = max(1, self.config.line_thickness // 2)
+        text_size = cv2.getTextSize(label, self._font, font_scale, font_thickness)[0]
+
+        text_bg_y1 = max(10, y1 - text_size[1] - 4)
+        text_bg_x1 = x1
+        text_bg_x2 = text_bg_x1 + text_size[0] + 4
+        text_bg_y2 = text_bg_y1 + text_size[1] + 4
+
+        cv2.rectangle(frame, (text_bg_x1, text_bg_y1), (text_bg_x2, text_bg_y2), color, -1)
+
+        cv2.putText(
+            frame,
+            label,
+            (text_bg_x1 + 2, text_bg_y2 - 2),
+            self._font,
+            font_scale,
+            (255, 255, 255),
+            font_thickness,
+        )
+
+    def _draw_trajectory(
+        self,
+        frame: np.ndarray,
+        tracked_obj: TrackedObject,
+    ) -> None:
+        """Draw trajectory path for tracked object."""
+        trajectory_array = tracked_obj.get_trajectory_array()
+        if trajectory_array is None or len(trajectory_array) < 2:
+            return
+
+        color = self._get_color(tracked_obj.track_id % 80)
+        thickness = getattr(self.config, 'trajectory_thickness', 2)
+
+        trajectory_points = trajectory_array.astype(np.int32)
+
+        for i in range(len(trajectory_points) - 1):
+            pt1 = tuple(trajectory_points[i])
+            pt2 = tuple(trajectory_points[i + 1])
+
+            # Fade effect: older points more transparent
+            alpha = (i + 1) / len(trajectory_points)
+            faded_color = tuple(int(c * alpha) for c in color)
+
+            cv2.line(frame, pt1, pt2, faded_color, thickness)
+
+        # Draw current position marker
+        current_pt = tuple(trajectory_points[-1])
+        cv2.circle(frame, current_pt, 4, color, -1)
+
+    def _draw_tracking_stats(
+        self,
+        frame: np.ndarray,
+        tracking_result: TrackingResult,
+    ) -> None:
+        """Draw tracking statistics overlay."""
+        font_scale = self.config.font_scale * 0.8
+        font_thickness = max(1, self.config.line_thickness // 2)
+
+        stats_text = (
+            f"Tracks: {tracking_result.active_tracks} | "
+            f"Lost: {tracking_result.lost_tracks} | "
+            f"Total: {tracking_result.total_tracks}"
+        )
+        text_size = cv2.getTextSize(stats_text, self._font, font_scale, font_thickness)[0]
+
+        h = frame.shape[0]
+        x = 10
+        y = h - 35
+        padding = 4
+
+        cv2.rectangle(
+            frame,
+            (x, y - text_size[1] - padding),
+            (x + text_size[0] + 2 * padding, y + padding),
+            (0, 0, 0),
+            -1,
+        )
+
+        cv2.putText(
+            frame,
+            stats_text,
+            (x + padding, y),
+            self._font,
+            font_scale,
+            (0, 255, 200),
+            font_thickness,
+        )
