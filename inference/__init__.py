@@ -4,7 +4,13 @@ __version__ = "0.2.0"
 
 from .config import AppConfig, DetectorConfig, FrameSourceConfig, VisualizerConfig
 from .detector import Detector
-from .frame_source import FrameSource, WebcamFrameSource
+from .frame_source import (
+    FrameSource,
+    WebcamFrameSource,
+    VideoFileFrameSource,
+    RTSPFrameSource,
+    get_frame_source,
+)
 from .logger import get_logger, setup_logging
 from .tracker import CentroidTracker, Tracker
 from .tracking_config import TrackingConfig
@@ -21,6 +27,9 @@ __all__ = [
     "Detector",
     "FrameSource",
     "WebcamFrameSource",
+    "VideoFileFrameSource",
+    "RTSPFrameSource",
+    "get_frame_source",
     "Tracker",
     "CentroidTracker",
     "Detection",

@@ -21,7 +21,7 @@ import cv2
 
 from .config import AppConfig
 from .detector import Detector
-from .frame_source import WebcamFrameSource
+from .frame_source import get_frame_source
 from .logger import get_logger, setup_logging
 from .tracker import CentroidTracker
 from .visualizer import FpsCounter, Visualizer
@@ -91,7 +91,7 @@ def main() -> int:
         # 4. Initialize components (with context managers for resource cleanup)
         logger.info("Initializing inference pipeline...")
 
-        with WebcamFrameSource(config.frame_source_config) as frame_source:
+        with get_frame_source(config.frame_source_config) as frame_source:
             with Detector(config.detector_config) as detector:
                 visualizer = Visualizer(config.visualizer_config)
                 fps_counter = FpsCounter()
