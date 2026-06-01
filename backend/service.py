@@ -14,8 +14,10 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Dict, List
 from queue import Queue
+import numpy as np
 
 from inference import (
     AppConfig,
@@ -35,6 +37,13 @@ from .models import Detection as DetectionRecord, Metric, StreamSession, get_dat
 
 
 logger = logging.getLogger(__name__)
+
+
+def _to_python_type(value):
+    """Convert NumPy types to native Python types."""
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    return value
 
 
 @dataclass
@@ -141,7 +150,7 @@ class InferenceStream:
         ).first()
         if session_record:
             session_record.is_active = False
-            session_record.ended_at = time.time()
+            session_record.ended_at = datetime.utcnow()
             session_record.total_frames = self.metrics.total_frames
             session_record.total_detections = self.metrics.total_detections
             self.db.commit()
@@ -265,17 +274,17 @@ class InferenceStream:
         for det in detections:
             record = DetectionRecord(
                 frame_id=frame.frame_id,
-                timestamp=time.time(),
-                x1=det.x1,
-                y1=det.y1,
-                x2=det.x2,
-                y2=det.y2,
-                class_id=det.class_id,
+                timestamp=datetime.utcnow(),
+                x1=_to_python_type(det.x1),
+                y1=_to_python_type(det.y1),
+                x2=_to_python_type(det.x2),
+                y2=_to_python_type(det.y2),
+                class_id=_to_python_type(det.class_id),
                 class_name=det.class_name,
-                confidence=det.confidence,
-                track_id=getattr(det, 'track_id', None),
+                confidence=_to_python_type(det.confidence),
+                track_id=_to_python_type(getattr(det, 'track_id', None)),
                 stream_id=self.config.stream_id,
-                inference_time_ms=frame.timestamp,
+                inference_time_ms=0.0,
             )
             self.db.add(record)
 
