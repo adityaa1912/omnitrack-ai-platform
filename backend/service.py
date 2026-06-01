@@ -111,15 +111,20 @@ class InferenceStream:
             self.thread.start()
 
             # Record session in database
-            session = StreamSession(
-                stream_id=self.config.stream_id,
-                source=str(self.config.source),
-                width=self.config.width,
-                height=self.config.height,
-                tracking_enabled=self.config.tracking_enabled,
-            )
-            self.db.add(session)
-            self.db.commit()
+            try:
+                session = StreamSession(
+                    stream_id=self.config.stream_id,
+                    source=str(self.config.source),
+                    width=self.config.width,
+                    height=self.config.height,
+                    tracking_enabled=self.config.tracking_enabled,
+                )
+                self.db.add(session)
+                self.db.commit()
+            except Exception as db_err:
+                self.db.rollback()
+                logger.error(f"Database error while recording stream session: {db_err}")
+                raise
 
             logger.info(f"Stream {self.config.stream_id} started")
 
@@ -145,15 +150,19 @@ class InferenceStream:
         self._cleanup()
 
         # Update session in database
-        session_record = self.db.query(StreamSession).filter_by(
-            stream_id=self.config.stream_id
-        ).first()
-        if session_record:
-            session_record.is_active = False
-            session_record.ended_at = datetime.utcnow()
-            session_record.total_frames = self.metrics.total_frames
-            session_record.total_detections = self.metrics.total_detections
-            self.db.commit()
+        try:
+            session_record = self.db.query(StreamSession).filter_by(
+                stream_id=self.config.stream_id
+            ).first()
+            if session_record:
+                session_record.is_active = False
+                session_record.ended_at = datetime.utcnow()
+                session_record.total_frames = self.metrics.total_frames
+                session_record.total_detections = self.metrics.total_detections
+                self.db.commit()
+        except Exception as db_err:
+            self.db.rollback()
+            logger.error(f"Database error while updating stream session: {db_err}")
 
         logger.info(f"Stream {self.config.stream_id} stopped")
 
@@ -290,7 +299,11 @@ class InferenceStream:
 
         # Batch commit every 100 frames
         if frame.frame_id % 100 == 0:
-            self.db.commit()
+            try:
+                self.db.commit()
+            except Exception as db_err:
+                self.db.rollback()
+                logger.error(f"Database error while storing detections: {db_err}")
 
     def get_metrics(self) -> StreamMetrics:
         """Get current stream metrics."""

@@ -182,21 +182,26 @@ async def get_metrics(stream_id: str):
 async def get_detections(stream_id: str):
     """Get latest detections from a stream."""
     try:
-        detections = service.get_stream_detections(stream_id)
+        tracked_objects = service.get_stream_detections(stream_id)
 
-        return [
-            DetectionResponse(
-                x1=d.x1,
-                y1=d.y1,
-                x2=d.x2,
-                y2=d.y2,
-                class_id=d.class_id,
-                class_name=d.class_name,
-                confidence=d.confidence,
-                track_id=getattr(d, 'track_id', None),
-            )
-            for d in detections
-        ]
+        detections = []
+        for obj in tracked_objects:
+            # Extract detection from TrackedObject
+            detection = obj.current_detection
+            if detection is not None:
+                detections.append(
+                    DetectionResponse(
+                        x1=detection.x1,
+                        y1=detection.y1,
+                        x2=detection.x2,
+                        y2=detection.y2,
+                        class_id=detection.class_id,
+                        class_name=detection.class_name,
+                        confidence=detection.confidence,
+                        track_id=obj.track_id,
+                    )
+                )
+        return detections
 
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
