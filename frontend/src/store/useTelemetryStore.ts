@@ -45,6 +45,15 @@ export const useTelemetryStore = create<TelemetryStoreState>((set) => ({
     }),
 }));
 
+/**
+ * Shared stable empty array. Returning a fresh `[]` per selector call would
+ * create a new reference every render and defeat reference-based memoization
+ * downstream, causing needless chart rerenders. A single constant keeps the
+ * "no samples yet" case referentially stable.
+ */
+const EMPTY_SERIES: readonly TelemetrySample[] = Object.freeze([]);
+
 export const selectTelemetry =
-  (streamId: string) => (state: TelemetryStoreState) =>
-    state.series[streamId] ?? [];
+  (streamId: string) =>
+  (state: TelemetryStoreState): readonly TelemetrySample[] =>
+    state.series[streamId] ?? EMPTY_SERIES;
