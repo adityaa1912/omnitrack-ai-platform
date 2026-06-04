@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-surface-0 text-content-primary font-sans antialiased;
+    background-image: radial-gradient(
+      120% 80% at 50% -10%,
+      rgba(61, 169, 252, 0.06),
+      transparent 60%
+    );
+  }
+
+  /* Thin, infra-style scrollbars */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-surface-300 rounded-full border-2 border-solid border-transparent bg-clip-content;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+}
