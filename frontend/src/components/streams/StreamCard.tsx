@@ -54,7 +54,7 @@ export function StreamCard({ stream }: { stream: StreamSummary }) {
         <StreamStatusBadge status={socketStatus} />
       </div>
 
-      <StreamThumbnail />
+      <StreamThumbnail streamId={stream_id} />
 
       <StreamCardStats metrics={metrics} />
 
