@@ -1,8 +1,8 @@
-import { Panel } from "@/components/ui/Panel";
+import { StreamGrid } from "@/components/streams/StreamGrid";
 
 /**
- * Overview page placeholder. Real-time stream grid and telemetry are added
- * in later commits once the WS service and stores exist.
+ * Overview page. Renders the live stream grid. Aggregate telemetry charts
+ * are added in a later commit.
  */
 export function DashboardPage() {
   return (
@@ -13,11 +13,7 @@ export function DashboardPage() {
           Platform status and active inference streams.
         </p>
       </div>
-      <Panel className="flex h-64 items-center justify-center">
-        <span className="font-mono text-sm text-content-muted">
-          Stream grid &amp; telemetry land in the next commits.
-        </span>
-      </Panel>
+      <StreamGrid />
     </div>
   );
 }

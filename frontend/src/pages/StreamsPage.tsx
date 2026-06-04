@@ -1,6 +1,5 @@
-import { Panel } from "@/components/ui/Panel";
+import { StreamGrid } from "@/components/streams/StreamGrid";
 
-/** Streams page placeholder. Stream management UI is added in later commits. */
 export function StreamsPage() {
   return (
     <div className="space-y-6">
@@ -10,11 +9,7 @@ export function StreamsPage() {
           Manage inference stream lifecycle.
         </p>
       </div>
-      <Panel className="flex h-64 items-center justify-center">
-        <span className="font-mono text-sm text-content-muted">
-          Stream management UI coming soon.
-        </span>
-      </Panel>
+      <StreamGrid />
     </div>
   );
 }
