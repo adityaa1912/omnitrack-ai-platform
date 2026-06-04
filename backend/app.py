@@ -8,6 +8,7 @@ Provides WebSocket for real-time frame streaming.
 import logging
 import base64
 import cv2
+import numpy as np
 from typing import Optional, List
 from datetime import datetime
 
@@ -21,6 +22,16 @@ from inference.types import Detection as InferenceDetection
 
 
 logger = logging.getLogger(__name__)
+
+
+def _to_native(value):
+    """Convert NumPy scalar types to native Python types for JSON serialization."""
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
+
 
 # Initialize service
 service = InferenceService(db_path="inference_data.db")
@@ -263,22 +274,26 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
                 _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 frame_base64 = base64.b64encode(buffer).decode("utf-8")
 
-                # Send frame with detections
+                # Send frame with detections (coerce NumPy scalars -> native)
                 await websocket.send_json({
                     "type": "frame",
                     "stream_id": stream_id,
-                    "timestamp": frame_data["timestamp"],
+                    "timestamp": _to_native(frame_data["timestamp"]),
                     "frame": frame_base64,
                     "detections": [
                         {
-                            "x1": d.x1,
-                            "y1": d.y1,
-                            "x2": d.x2,
-                            "y2": d.y2,
-                            "class_id": d.class_id,
+                            "x1": _to_native(d.x1),
+                            "y1": _to_native(d.y1),
+                            "x2": _to_native(d.x2),
+                            "y2": _to_native(d.y2),
+                            "class_id": _to_native(d.class_id),
                             "class_name": d.class_name,
-                            "confidence": f"{d.confidence:.2f}",
-                            "track_id": getattr(d, 'track_id', None),
+                            "confidence": f"{float(d.confidence):.2f}",
+                            "track_id": (
+                                None
+                                if getattr(d, "track_id", None) is None
+                                else int(getattr(d, "track_id"))
+                            ),
                         }
                         for d in frame_data["detections"]
                     ],
