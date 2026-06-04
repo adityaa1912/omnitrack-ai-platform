@@ -1,9 +1,16 @@
 # Python
+venv/
+.venv/
 __pycache__/
 *.pyc
 
-# Virtual Environment
-venv/
+# Databases
+*.db
 
-# Model weights
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
 *.pt
