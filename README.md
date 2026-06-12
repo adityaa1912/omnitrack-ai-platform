@@ -1,4 +1,4 @@
-````md
+
 # OmniTrack AI Platform
 
 <p align="center">
