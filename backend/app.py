@@ -12,7 +12,7 @@ import numpy as np
 from typing import Optional, List
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import numpy as np
@@ -32,6 +32,10 @@ def _to_native(value):
         return float(value)
     return value
 
+
+# Event history query bounds (read from the in-memory event store).
+DEFAULT_EVENT_LIMIT = 100
+MAX_EVENT_LIMIT = 1000
 
 # Initialize service
 service = InferenceService(db_path="inference_data.db")
@@ -99,6 +103,26 @@ class StreamResponse(BaseModel):
     source: str
     is_running: bool
     metrics: MetricsResponse
+
+
+class EventResponse(BaseModel):
+    """A single derived event record from the in-memory event store.
+
+    Mirrors `Event.to_dict()` plus the `seq` stamped by the event buffer. `seq`
+    is a monotonic, gap-free ordering key per stream and is preserved here so
+    clients can de-duplicate and order events independently of `timestamp`.
+    """
+    seq: int
+    stream_id: str
+    event_type: str
+    severity: str
+    severity_rank: int
+    frame_id: int
+    timestamp: float
+    track_id: Optional[int] = None
+    class_name: Optional[str] = None
+    message: str = ""
+    metadata: dict = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
@@ -218,6 +242,27 @@ async def get_detections(stream_id: str):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.get("/stream/{stream_id}/events", response_model=List[EventResponse])
+async def get_events(
+    stream_id: str,
+    limit: int = Query(
+        default=DEFAULT_EVENT_LIMIT,
+        ge=1,
+        le=MAX_EVENT_LIMIT,
+        description="Maximum number of events to return, newest-first.",
+    ),
+):
+    """Get recent derived events for a stream, newest-first.
+
+    Reads from the in-memory event store only (no database). Returns an empty
+    list for streams with no buffered history (unknown, or never produced an
+    event), so this endpoint never 404s on a valid stream id. `seq` ordering
+    keys are preserved on each record.
+    """
+    events = service.get_stream_events(stream_id, limit=limit)
+    return [EventResponse(**event) for event in events]
+
+
 @app.get("/streams", response_model=List[StreamResponse])
 async def list_streams():
     """List all active streams."""
@@ -325,6 +370,7 @@ async def root():
             "POST /stream/stop": "Stop an inference stream",
             "GET /stream/{stream_id}/metrics": "Get stream metrics",
             "GET /stream/{stream_id}/detections": "Get latest detections",
+            "GET /stream/{stream_id}/events": "Get recent derived events (newest-first)",
             "GET /streams": "List all active streams",
             "WS /stream/{stream_id}/ws": "Real-time frame streaming",
             "GET /health": "Service health check",

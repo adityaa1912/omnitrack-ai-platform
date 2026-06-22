@@ -429,3 +429,18 @@ class InferenceService:
             raise ValueError(f"Stream {stream_id} not found")
 
         return self.streams[stream_id].get_output_frame(timeout)
+
+    def get_stream_events(
+        self, stream_id: str, limit: Optional[int] = None
+    ) -> List[dict]:
+        """Return recent events for a stream, newest-first.
+
+        Reads only from the in-memory event store (no database), so history is
+        available even after a stream has stopped. Returns an empty list when
+        the stream has no buffered history — this never raises for an unknown
+        stream id, since event history is independent of the live stream set.
+        """
+        buffer = self.event_store.get(stream_id)
+        if buffer is None:
+            return []
+        return buffer.latest(limit=limit)
