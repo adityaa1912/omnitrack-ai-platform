@@ -8,13 +8,14 @@ the set of currently-known track ids so detectors can drop state for tracks
 that no longer exist. This is what keeps the engine bounded-memory regardless
 of how long a stream runs.
 
-This commit ships the four detectors that need no scene geometry:
+This module holds the detectors that need no scene geometry:
   - AppearanceDetector  -> OBJECT_APPEARED / OBJECT_DISAPPEARED
   - StationaryDetector  -> STATIONARY_OBJECT
   - NearCollisionDetector -> NEAR_COLLISION
 
-The geometry-dependent detectors (entered/exited/crossing/dwell) are added in a
-later commit and plug into the same interface.
+It also defines the shared detector interface (`EventDetector`, `FrameContext`,
+`TrackMeta`). The geometry-dependent detectors (entered/exited/crossing/dwell)
+live in `geometry_detectors.py` and plug into the same interface.
 """
 
 from __future__ import annotations

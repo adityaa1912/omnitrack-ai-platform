@@ -28,14 +28,23 @@ from .detectors import (
     TrackMeta,
 )
 from .event_types import Event
+from .geometry_detectors import LineCrossingDetector, ZoneDetector
 
 
 def default_detectors() -> list[EventDetector]:
-    """The detectors enabled in this commit (config-free)."""
+    """
+    All built-in detectors.
+
+    The geometry detectors (zone/line) are inert until zones/lines are
+    configured on `EventEngineConfig`, so this default set is safe for any
+    stream — an unconfigured stream produces only the config-free events.
+    """
     return [
         AppearanceDetector(),
         StationaryDetector(),
         NearCollisionDetector(),
+        ZoneDetector(),
+        LineCrossingDetector(),
     ]
 
 

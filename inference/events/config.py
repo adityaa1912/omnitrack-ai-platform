@@ -1,10 +1,10 @@
 """
 Tunable configuration for the event engine.
 
-Only the parameters needed by the config-free detectors (stationary, near
-collision) are present in this commit. Zone and line geometry for the
-entered/exited/crossing/dwell detectors are added in a later commit; this
-dataclass is the single extension point for them.
+Holds the thresholds for the config-free detectors (stationary, near collision)
+and the scene geometry (zones, crossing lines, dwell threshold) consumed by the
+geometry detectors. This dataclass is the single extension point for new
+detector parameters.
 
 Every threshold uses hysteresis where relevant: a tighter value to *raise* an
 event and a looser value to *clear* it. This prevents an object hovering at the
@@ -14,6 +14,8 @@ boundary from emitting a storm of duplicate events.
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .regions import CrossingLine, Zone
 
 
 @dataclass
@@ -39,7 +41,22 @@ class EventEngineConfig:
     near_collision_distance_px: float = 60.0
     near_collision_clear_distance_px: float = 90.0
 
+    # --- Scene geometry (zone & line detectors) ---
+    # When empty (the default) the geometry detectors are inert, so an
+    # unconfigured stream behaves exactly as before this commit.
+    zones: tuple[Zone, ...] = ()
+    lines: tuple[CrossingLine, ...] = ()
+
+    # A track continuously inside a zone for at least `dwell_seconds`
+    # (measured on source-frame timestamps) raises one DWELL_TIME event.
+    dwell_seconds: float = 5.0
+
     def __post_init__(self) -> None:
+        # Coerce region collections to immutable tuples for safe sharing.
+        self.zones = tuple(self.zones)
+        self.lines = tuple(self.lines)
+        if self.dwell_seconds <= 0:
+            raise ValueError("dwell_seconds must be > 0")
         if self.stationary_clear_spread_px < self.stationary_max_spread_px:
             raise ValueError(
                 "stationary_clear_spread_px must be >= stationary_max_spread_px "

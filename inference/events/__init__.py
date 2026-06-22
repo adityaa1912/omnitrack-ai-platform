@@ -18,18 +18,41 @@ from .detectors import (
 )
 from .engine import EventEngine, default_detectors
 from .event_types import Event, EventType, Severity
+from .geometry import (
+    Point,
+    crossing_sign,
+    point_in_polygon,
+    segments_intersect,
+    side,
+)
+from .geometry_detectors import LineCrossingDetector, ZoneDetector
+from .regions import CrossingLine, Zone
 
 __all__ = [
+    # Engine + config
     "EventEngine",
     "EventEngineConfig",
     "default_detectors",
+    # Value types
     "Event",
     "EventType",
     "Severity",
+    # Regions / geometry config
+    "Zone",
+    "CrossingLine",
+    "Point",
+    # Detectors
     "EventDetector",
     "FrameContext",
     "TrackMeta",
     "AppearanceDetector",
     "StationaryDetector",
     "NearCollisionDetector",
+    "ZoneDetector",
+    "LineCrossingDetector",
+    # Geometry primitives
+    "point_in_polygon",
+    "segments_intersect",
+    "crossing_sign",
+    "side",
 ]
