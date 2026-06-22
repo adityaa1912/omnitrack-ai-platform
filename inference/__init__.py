@@ -4,6 +4,7 @@ __version__ = "0.2.0"
 
 from .config import AppConfig, DetectorConfig, FrameSourceConfig, VisualizerConfig
 from .detector import Detector
+from .events import Event, EventEngine, EventEngineConfig, EventType, Severity
 from .frame_source import (
     FrameSource,
     WebcamFrameSource,
@@ -32,6 +33,11 @@ __all__ = [
     "get_frame_source",
     "Tracker",
     "CentroidTracker",
+    "EventEngine",
+    "EventEngineConfig",
+    "Event",
+    "EventType",
+    "Severity",
     "Detection",
     "Frame",
     "InferenceResult",
