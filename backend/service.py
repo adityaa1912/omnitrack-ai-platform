@@ -33,7 +33,9 @@ from inference.config import (
 )
 from inference.tracking_config import TrackingConfig
 from inference.types import Detection, Frame
+from inference.events import EventEngine, EventEngineConfig
 from .models import Detection as DetectionRecord, Metric, StreamSession, get_database_session
+from .event_store import EventStore
 
 
 logger = logging.getLogger(__name__)
@@ -75,7 +77,7 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, db_session) -> None:
+    def __init__(self, config: StreamConfig, db_session, event_buffer=None) -> None:
         self.config = config
         self.db = db_session
 
@@ -84,6 +86,10 @@ class InferenceStream:
         self.detector = None
         self.tracker = None
         self.visualizer = None
+        self.event_engine: Optional[EventEngine] = None
+
+        # Bounded in-memory event sink (ring buffer owned by the service).
+        self.event_buffer = event_buffer
 
         # State
         self.is_running = False
@@ -190,6 +196,13 @@ class InferenceStream:
             )
             self.tracker = CentroidTracker(tracking_config)
 
+            # Events derive from tracker output, so the engine exists only when
+            # tracking is enabled. Default config => geometry detectors inert.
+            self.event_engine = EventEngine(
+                stream_id=self.config.stream_id,
+                config=EventEngineConfig(),
+            )
+
         visualizer_config = VisualizerConfig(
             show_fps=True,
             show_confidence=True,
@@ -220,6 +233,7 @@ class InferenceStream:
                     self.metrics.total_frames += 1
 
                     # Run tracking if enabled
+                    tracking_result = None
                     if self.tracker is not None:
                         tracking_result = self.tracker.update(
                             result.detections,
@@ -258,6 +272,13 @@ class InferenceStream:
                     except:
                         pass  # Queue full, drop frame
 
+                    # Derive events AFTER the frame has been queued, so event
+                    # generation sits off the frame-delivery path and can never
+                    # delay or block it. Guarded internally so it can never
+                    # break the inference loop.
+                    if tracking_result is not None:
+                        self._process_events(tracking_result)
+
                 except Exception as e:
                     logger.error(f"Error in inference loop: {e}", exc_info=True)
                     self.metrics.is_active = False
@@ -267,6 +288,29 @@ class InferenceStream:
         finally:
             self._cleanup()
             logger.info(f"Inference loop finished for {self.config.stream_id}")
+
+    def _process_events(self, tracking_result) -> None:
+        """
+        Derive events from one tracking result and append them to the event
+        buffer.
+
+        Called after the output frame has already been queued, so it is off the
+        frame-delivery path. Wrapped in a broad guard: event derivation must
+        never raise into — and so never stall or kill — the inference loop.
+        Memory stays bounded (the engine prunes per-frame state to live tracks;
+        the buffer is a fixed-capacity ring).
+        """
+        if self.event_engine is None or self.event_buffer is None:
+            return
+        try:
+            events = self.event_engine.process(tracking_result)
+            if events:
+                self.event_buffer.extend(event.to_dict() for event in events)
+        except Exception as exc:
+            logger.error(
+                f"Event processing error for stream {self.config.stream_id}: {exc}",
+                exc_info=True,
+            )
 
     def _update_metrics(self, inference_time_ms: float, num_detections: int) -> None:
         """Update running metrics."""
@@ -324,16 +368,22 @@ class InferenceStream:
 class InferenceService:
     """Service managing multiple inference streams."""
 
-    def __init__(self, db_path: str = "inference_data.db") -> None:
+    def __init__(self, db_path: str = "inference_data.db", event_capacity: int = 1000) -> None:
         self.db = get_database_session(db_path)
         self.streams: Dict[str, InferenceStream] = {}
+        # Bounded in-memory event history per stream (persists across stop).
+        self.event_store = EventStore(capacity=event_capacity)
 
     def start_stream(self, config: StreamConfig) -> StreamMetrics:
         """Start a new inference stream."""
         if config.stream_id in self.streams:
             raise ValueError(f"Stream {config.stream_id} already exists")
 
-        stream = InferenceStream(config, self.db)
+        stream = InferenceStream(
+            config,
+            self.db,
+            event_buffer=self.event_store.get_or_create(config.stream_id),
+        )
         stream.start()
         self.streams[config.stream_id] = stream
 
