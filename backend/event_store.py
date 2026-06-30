@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 # Default number of records retained per stream when no capacity is given.
 DEFAULT_CAPACITY = 1000
@@ -61,6 +61,14 @@ class EventBuffer:
         # as a total-appended counter and a stable per-record id.
         self._seq = 0
 
+        # Push-notification subscribers, guarded by their OWN lock (never the
+        # storage lock), so registering/removing a subscriber never contends
+        # with appends and callbacks can re-enter the buffer without deadlock.
+        # `_sub_seq` mints monotonic integer tokens that are never reused.
+        self._subscribers: Dict[int, Callable[[Record], None]] = {}
+        self._sub_lock = threading.Lock()
+        self._sub_seq = 0
+
     # -- properties ---------------------------------------------------------
 
     @property
@@ -90,7 +98,10 @@ class EventBuffer:
         can forward exactly what was retained (e.g. to live subscribers later).
         """
         with self._lock:
-            return self._append_locked(record)
+            stored = self._append_locked(record)
+        # Notify AFTER releasing the storage lock (see `_notify`).
+        self._notify((stored,))
+        return stored
 
     def extend(self, records: Iterable[Record]) -> List[Record]:
         """
@@ -100,7 +111,11 @@ class EventBuffer:
         from one frame lands contiguously and with consecutive `seq` values.
         """
         with self._lock:
-            return [self._append_locked(record) for record in records]
+            stored = [self._append_locked(record) for record in records]
+        # The whole batch lands before any subscriber is notified, so a callback
+        # always observes the full post-batch buffer state.
+        self._notify(stored)
+        return stored
 
     def _append_locked(self, record: Record) -> Record:
         """Append one record; caller must hold `self._lock`."""
@@ -109,6 +124,59 @@ class EventBuffer:
         stored["seq"] = self._seq
         self._records.append(stored)  # deque(maxlen) evicts oldest when full
         return stored
+
+    # -- subscriptions ------------------------------------------------------
+
+    def subscribe(self, callback: Callable[[Record], None]) -> int:
+        """
+        Register `callback` to be invoked once per appended record, in append
+        order, and return an integer token for `unsubscribe`.
+
+        Callbacks run on the appending thread, OUTSIDE the storage lock, so they
+        must be cheap and non-blocking (e.g. hand the record to a queue). They
+        must not assume isolation from other subscribers' side effects. A
+        callback that raises is isolated: its exception is swallowed and does
+        not affect the producer or other subscribers.
+        """
+        with self._sub_lock:
+            self._sub_seq += 1
+            token = self._sub_seq
+            self._subscribers[token] = callback
+        return token
+
+    def unsubscribe(self, token: int) -> None:
+        """
+        Remove a previously registered subscriber.
+
+        Idempotent: an unknown or already-removed token is ignored. Tokens are
+        never reused, so this can never detach a different subscriber.
+        """
+        with self._sub_lock:
+            self._subscribers.pop(token, None)
+
+    def _notify(self, records: Iterable[Record]) -> None:
+        """
+        Deliver `records` to every subscriber, in order.
+
+        Invoked by `append`/`extend` AFTER the storage lock is released. The
+        subscriber set is snapshotted under `_sub_lock` and then iterated with
+        no lock held, so callbacks may freely re-enter the buffer and one slow
+        or failing callback cannot stall appends. Each callback is guarded so a
+        failure in one subscriber never reaches the producer or its peers.
+        """
+        records = list(records)
+        if not records:
+            return
+        with self._sub_lock:
+            callbacks = list(self._subscribers.values())
+        if not callbacks:
+            return
+        for record in records:
+            for callback in callbacks:
+                try:
+                    callback(record)
+                except Exception:  # noqa: BLE001 - isolate misbehaving subscribers
+                    pass
 
     # -- reads --------------------------------------------------------------
 
@@ -377,6 +445,81 @@ def test_store_registry() -> None:
     assert store.get("s1") is None and store.stream_ids() == ["s2"]
 
 
+def test_subscribe_notify() -> None:
+    buf = EventBuffer(capacity=10)
+    received: List[Record] = []
+    token = buf.subscribe(received.append)
+    assert isinstance(token, int) and token >= 1, "subscribe returns an int token"
+
+    stored = buf.append(_rec("object_appeared", "info"))
+    assert received and received[-1] is stored, "subscriber sees the stored record"
+    assert received[-1]["seq"] == 1, "delivered record carries its seq"
+
+    batch = buf.extend([_rec("a", "info"), _rec("b", "low")])
+    assert [r["seq"] for r in received] == [1, 2, 3], "delivered in append order"
+    assert received[1:] == batch, "extend delivers each stored record, in order"
+
+
+def test_unsubscribe() -> None:
+    buf = EventBuffer(capacity=10)
+    received: List[Record] = []
+    token = buf.subscribe(received.append)
+
+    buf.append(_rec("a", "info"))
+    buf.unsubscribe(token)
+    buf.append(_rec("b", "info"))
+    assert [r["event_type"] for r in received] == ["a"], "no delivery after unsubscribe"
+
+    # Idempotent: double-unsubscribe and unknown tokens must not raise.
+    buf.unsubscribe(token)
+    buf.unsubscribe(999999)
+
+
+def test_subscriber_isolation() -> None:
+    buf = EventBuffer(capacity=10)
+    good: List[Record] = []
+
+    def boom(_record: Record) -> None:
+        raise RuntimeError("subscriber failure")
+
+    buf.subscribe(boom)
+    buf.subscribe(good.append)
+
+    # A failing subscriber must not break the producer or other subscribers.
+    stored = buf.append(_rec("a", "info"))
+    assert good and good[-1] is stored, "healthy subscriber still receives"
+    assert len(buf) == 1, "append still succeeded despite a callback error"
+
+
+def test_subscribe_tokens_monotonic() -> None:
+    buf = EventBuffer(capacity=10)
+    t1 = buf.subscribe(lambda r: None)
+    t2 = buf.subscribe(lambda r: None)
+    buf.unsubscribe(t1)
+    t3 = buf.subscribe(lambda r: None)
+    assert t1 < t2 < t3, "tokens are strictly increasing"
+    assert t3 != t1, "tokens are never reused after unsubscribe"
+
+
+def test_notify_outside_lock() -> None:
+    # A callback that re-enters the buffer (which acquires the storage lock)
+    # must not deadlock — proof that callbacks run OUTSIDE the storage lock
+    # (threading.Lock is non-reentrant, so a held lock would hang here).
+    buf = EventBuffer(capacity=10)
+    seen_lengths: List[int] = []
+
+    def reentrant(_record: Record) -> None:
+        seen_lengths.append(len(buf))  # len() acquires the storage lock
+        buf.snapshot()                 # snapshot() acquires it too
+
+    buf.subscribe(reentrant)
+    buf.append(_rec("a", "info"))
+    # extend appends the whole batch before notifying, so both notifications
+    # observe the full post-batch length (3), not 2 then 3.
+    buf.extend([_rec("b", "info"), _rec("c", "info")])
+    assert seen_lengths == [1, 3, 3], "callback observed buffer state without deadlock"
+
+
 def _validation_checks() -> None:
     """Constructor and edge-case guards."""
     for bad in (0, -1):
@@ -406,6 +549,11 @@ def _run_tests() -> int:
         ("clear() empties but keeps seq", test_clear),
         ("monotonic seq (sequential + concurrent)", test_monotonic_seq),
         ("EventStore registry", test_store_registry),
+        ("subscribe()/notify delivery", test_subscribe_notify),
+        ("unsubscribe() stops delivery (idempotent)", test_unsubscribe),
+        ("subscriber exception isolation", test_subscriber_isolation),
+        ("monotonic, non-reused subscriber tokens", test_subscribe_tokens_monotonic),
+        ("callbacks run outside the storage lock", test_notify_outside_lock),
         ("constructor validation", _validation_checks),
     ]
 
