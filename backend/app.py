@@ -5,6 +5,7 @@ Exposes REST API for stream control and metrics.
 Provides WebSocket for real-time frame streaming.
 """
 
+import asyncio
 import logging
 import base64
 import cv2
@@ -354,6 +355,132 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
 
 
 # ============================================================================
+# WebSocket Endpoint for Live Event Streaming
+# ============================================================================
+
+# Per-connection bound on buffered live events. This is independent of the event
+# store's retention: it caps how many events may queue for a single slow client
+# before the oldest is dropped, so one stalled consumer can neither grow server
+# memory without bound nor back-pressure the inference thread.
+EVENT_WS_QUEUE_MAXSIZE = 100
+
+
+@app.websocket("/stream/{stream_id}/events/ws")
+async def websocket_events(websocket: WebSocket, stream_id: str):
+    """
+    WebSocket endpoint for live derived events (pushed, never polled).
+
+    A dedicated transport, fully independent of the frame WebSocket
+    (`/stream/{stream_id}/ws`): it carries only small JSON event records, never
+    frames or telemetry. The client subscribes to the stream's EventBuffer and
+    each newly appended event is pushed as it is produced.
+
+    Isolation & bounded memory:
+      - The buffer invokes our subscriber callback on the *inference* thread.
+        That callback does nothing but hand the record to this connection's
+        event loop via `loop.call_soon_threadsafe`, so event derivation never
+        blocks on a socket and the frame hot path is untouched.
+      - Each client owns a bounded `asyncio.Queue` (EVENT_WS_QUEUE_MAXSIZE). A
+        consumer that falls behind never grows memory without bound: the oldest
+        queued event is evicted (recency wins for a live feed) and the client is
+        told, once, via a coalesced `gap` notice carrying how many it missed.
+      - The subscription is always torn down on disconnect (the `finally`), so a
+        departed client leaves no callback registered on the buffer.
+    """
+    await websocket.accept()
+    logger.info(f"Event WebSocket client connected to stream {stream_id}")
+
+    buffer = service.event_store.get_or_create(stream_id)
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_WS_QUEUE_MAXSIZE)
+
+    # Events dropped to make room since the last `gap` notice was delivered.
+    # Mutated only on the event-loop thread (in `_enqueue`, scheduled via
+    # call_soon_threadsafe, and in the send loop), so it needs no lock.
+    dropped_since_gap = 0
+
+    def _enqueue(record: dict) -> None:
+        """Place one record on the queue. Runs on the event-loop thread.
+
+        On overflow, evict the oldest queued event and remember the drop; the
+        send loop coalesces all drops into a single `gap` notification. The
+        newest event is always retained.
+        """
+        nonlocal dropped_since_gap
+        try:
+            queue.put_nowait(record)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()  # drop the oldest to make room
+            except asyncio.QueueEmpty:
+                pass
+            dropped_since_gap += 1
+            try:
+                queue.put_nowait(record)
+            except asyncio.QueueFull:  # pragma: no cover - defensive
+                pass
+
+    def _on_event(record: dict) -> None:
+        """Buffer subscriber callback. Runs on the INFERENCE thread.
+
+        Must be cheap and non-blocking: it only schedules `_enqueue` on this
+        connection's loop. Guarded so a late append during shutdown (loop
+        closing) can never raise back into the producer.
+        """
+        try:
+            loop.call_soon_threadsafe(_enqueue, record)
+        except RuntimeError:  # event loop is closed/closing
+            pass
+
+    token = buffer.subscribe(_on_event)
+
+    async def _send_loop() -> None:
+        """Drain the queue forever, blocking on `get()` — no polling."""
+        nonlocal dropped_since_gap
+        while True:
+            record = await queue.get()
+            if dropped_since_gap:
+                missed = dropped_since_gap
+                dropped_since_gap = 0
+                await websocket.send_json({"type": "gap", "dropped": missed})
+            await websocket.send_json({"type": "event", "event": record})
+
+    async def _watch_disconnect() -> None:
+        """Surface a client disconnect even when no events are flowing.
+
+        This channel is push-only; we never act on client messages, but reading
+        drains them and lets `receive()` report the disconnect promptly.
+        """
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+
+    send_task = asyncio.create_task(_send_loop())
+    watch_task = asyncio.create_task(_watch_disconnect())
+    try:
+        # Whichever finishes first ends the session: a send failure (client
+        # gone) or an observed disconnect.
+        await asyncio.wait(
+            {send_task, watch_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        buffer.unsubscribe(token)  # stop producing into a dead connection
+        for task in (send_task, watch_task):
+            task.cancel()
+        # Consume any pending result/exception so it isn't logged as
+        # "Task exception was never retrieved".
+        for task in (send_task, watch_task):
+            try:
+                await task
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                pass
+            except Exception:  # noqa: BLE001 - disconnect races are expected
+                pass
+        logger.info(f"Event WebSocket client disconnected from stream {stream_id}")
+
+
+# ============================================================================
 # Static Info Endpoints
 # ============================================================================
 
@@ -373,6 +500,7 @@ async def root():
             "GET /stream/{stream_id}/events": "Get recent derived events (newest-first)",
             "GET /streams": "List all active streams",
             "WS /stream/{stream_id}/ws": "Real-time frame streaming",
+            "WS /stream/{stream_id}/events/ws": "Real-time event streaming",
             "GET /health": "Service health check",
         },
     }
