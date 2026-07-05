@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from queue import Queue
 import numpy as np
 
@@ -34,7 +34,8 @@ from inference.config import (
 from inference.tracking_config import TrackingConfig
 from inference.types import Detection, Frame
 from inference.events import EventEngine, EventEngineConfig
-from .models import Detection as DetectionRecord, Metric, StreamSession, get_database_session
+from inference.events.regions import CrossingLine, Zone
+from .models import Detection as DetectionRecord, StreamSession, create_session_factory
 from .event_store import EventStore
 
 
@@ -61,6 +62,14 @@ class StreamConfig:
     track_distance: float = 50.0
     max_age: int = 30
 
+    # Scene geometry consumed by the event engine's zone/line detectors. Empty
+    # by default => those detectors stay inert (behaviorally unchanged). Built
+    # by the API layer from validated request specs and fixed for the stream's
+    # lifetime, so the inference thread reads an immutable config (no locks).
+    zones: Tuple[Zone, ...] = ()
+    lines: Tuple[CrossingLine, ...] = ()
+    dwell_seconds: float = 5.0
+
 
 @dataclass
 class StreamMetrics:
@@ -77,9 +86,12 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, db_session, event_buffer=None) -> None:
+    def __init__(self, config: StreamConfig, session_factory, event_buffer=None) -> None:
         self.config = config
-        self.db = db_session
+        # Thread-safe session registry (scoped_session). Each thread that writes
+        # obtains its OWN session via `self._session_factory()` and releases it
+        # with `.remove()` when done; a Session is never shared across threads.
+        self._session_factory = session_factory
 
         # Components
         self.frame_source = None
@@ -116,21 +128,25 @@ class InferenceStream:
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
 
-            # Record session in database
+            # Record the session row on THIS (request) thread's own session.
+            db = self._session_factory()
             try:
-                session = StreamSession(
-                    stream_id=self.config.stream_id,
-                    source=str(self.config.source),
-                    width=self.config.width,
-                    height=self.config.height,
-                    tracking_enabled=self.config.tracking_enabled,
+                db.add(
+                    StreamSession(
+                        stream_id=self.config.stream_id,
+                        source=str(self.config.source),
+                        width=self.config.width,
+                        height=self.config.height,
+                        tracking_enabled=self.config.tracking_enabled,
+                    )
                 )
-                self.db.add(session)
-                self.db.commit()
+                db.commit()
             except Exception as db_err:
-                self.db.rollback()
+                db.rollback()
                 logger.error(f"Database error while recording stream session: {db_err}")
                 raise
+            finally:
+                self._session_factory.remove()
 
             logger.info(f"Stream {self.config.stream_id} started")
 
@@ -141,35 +157,23 @@ class InferenceStream:
             raise
 
     def stop(self) -> None:
-        """Stop the inference stream."""
+        """Stop the inference stream.
+
+        Signals the loop to exit and waits for the thread to drain. The session
+        row is closed and buffered detections are flushed by the loop's own
+        `finally` (see `_run` / `_finalize_session`) — for EVERY termination
+        cause, not just an explicit stop — so this method performs no DB writes
+        and holds no session. That keeps all of a stream's DB access on its own
+        thread and makes reaping a naturally-finished stream trivial.
+        """
         if not self.is_running:
             logger.warning(f"Stream {self.config.stream_id} not running")
             return
 
         self.is_running = False
-
-        # Wait for thread to finish
         if self.thread is not None:
             self.thread.join(timeout=5.0)
-
-        # Cleanup resources
         self._cleanup()
-
-        # Update session in database
-        try:
-            session_record = self.db.query(StreamSession).filter_by(
-                stream_id=self.config.stream_id
-            ).first()
-            if session_record:
-                session_record.is_active = False
-                session_record.ended_at = datetime.utcnow()
-                session_record.total_frames = self.metrics.total_frames
-                session_record.total_detections = self.metrics.total_detections
-                self.db.commit()
-        except Exception as db_err:
-            self.db.rollback()
-            logger.error(f"Database error while updating stream session: {db_err}")
-
         logger.info(f"Stream {self.config.stream_id} stopped")
 
     def _initialize_components(self) -> None:
@@ -197,10 +201,15 @@ class InferenceStream:
             self.tracker = CentroidTracker(tracking_config)
 
             # Events derive from tracker output, so the engine exists only when
-            # tracking is enabled. Default config => geometry detectors inert.
+            # tracking is enabled. Geometry detectors are active only when the
+            # config carries zones/lines; otherwise they stay inert.
             self.event_engine = EventEngine(
                 stream_id=self.config.stream_id,
-                config=EventEngineConfig(),
+                config=EventEngineConfig(
+                    zones=self.config.zones,
+                    lines=self.config.lines,
+                    dwell_seconds=self.config.dwell_seconds,
+                ),
             )
 
         visualizer_config = VisualizerConfig(
@@ -219,6 +228,9 @@ class InferenceStream:
 
     def _run(self) -> None:
         """Main inference loop (runs in background thread)."""
+        # This thread's own database session (see `create_session_factory`);
+        # confined to this thread and released in the `finally` below.
+        db = self._session_factory()
         try:
             logger.info(f"Inference loop started for {self.config.stream_id}")
 
@@ -260,7 +272,7 @@ class InferenceStream:
                     self._update_metrics(result.inference_time_ms, len(result.detections))
 
                     # Store detections in database
-                    self._store_detections(result.detections, frame)
+                    self._store_detections(db, result.detections, frame)
 
                     # Add to output queue (non-blocking)
                     try:
@@ -286,8 +298,43 @@ class InferenceStream:
                     break
 
         finally:
+            # Finalize on THIS thread's session, for every termination cause
+            # (EOF, error, or an explicit stop): flush tail detections AND close
+            # out the session row. Then release the session, mark the loop ended
+            # (truthful status for the reaper), and free resources.
+            self._finalize_session(db)
+            self._session_factory.remove()
+            self.is_running = False
             self._cleanup()
             logger.info(f"Inference loop finished for {self.config.stream_id}")
+
+    def _finalize_session(self, db) -> None:
+        """Close out the StreamSession row and flush any pending detections.
+
+        Runs once per stream lifetime, on the inference thread's own session
+        (from `_run`'s finally). Idempotent via the `ended_at` guard: only the
+        first finalize stamps the end time and totals, so this never
+        double-writes even if called again. The commit also flushes detections
+        added since the last periodic commit.
+        """
+        try:
+            record = (
+                db.query(StreamSession)
+                .filter_by(stream_id=self.config.stream_id)
+                .first()
+            )
+            if record is not None and record.ended_at is None:
+                record.is_active = False
+                record.ended_at = datetime.utcnow()
+                record.total_frames = self.metrics.total_frames
+                record.total_detections = self.metrics.total_detections
+            db.commit()
+        except Exception as db_err:
+            db.rollback()
+            logger.error(
+                f"Database error while finalizing stream session "
+                f"{self.config.stream_id}: {db_err}"
+            )
 
     def _process_events(self, tracking_result) -> None:
         """
@@ -322,8 +369,8 @@ class InferenceStream:
         self.metrics.fps = 1000.0 / max(self.metrics.inference_time_avg_ms, 1.0)
         self.metrics.total_detections += num_detections
 
-    def _store_detections(self, detections: List[Detection], frame: Frame) -> None:
-        """Persist detections to database."""
+    def _store_detections(self, db, detections: List[Detection], frame: Frame) -> None:
+        """Persist detections using the calling thread's session `db`."""
         for det in detections:
             record = DetectionRecord(
                 frame_id=frame.frame_id,
@@ -339,14 +386,14 @@ class InferenceStream:
                 stream_id=self.config.stream_id,
                 inference_time_ms=0.0,
             )
-            self.db.add(record)
+            db.add(record)
 
-        # Batch commit every 100 frames
+        # Batch commit every 100 frames to bound the unit-of-work size.
         if frame.frame_id % 100 == 0:
             try:
-                self.db.commit()
+                db.commit()
             except Exception as db_err:
-                self.db.rollback()
+                db.rollback()
                 logger.error(f"Database error while storing detections: {db_err}")
 
     def get_metrics(self) -> StreamMetrics:
@@ -364,24 +411,54 @@ class InferenceStream:
         except:
             return None
 
+    def reconfigure(
+        self,
+        zones: Tuple[Zone, ...],
+        lines: Tuple[CrossingLine, ...],
+        dwell_seconds: float,
+    ) -> None:
+        """Apply new scene geometry to the running event engine, live.
+
+        Delegates to ``EventEngine.reconfigure`` (which swaps the geometry
+        detectors atomically w.r.t. the inference thread) and updates this
+        stream's config so ``get_stream_regions`` stays accurate. Raises if the
+        stream has no event engine (tracking disabled). Only geometry fields are
+        touched; ``stream_id`` and the rest of the config are untouched, and the
+        inference loop never reads these fields live, so this is race-free.
+        """
+        if self.event_engine is None:
+            raise ValueError("Stream has no event engine (tracking is disabled)")
+        self.event_engine.reconfigure(
+            EventEngineConfig(zones=zones, lines=lines, dwell_seconds=dwell_seconds)
+        )
+        self.config.zones = zones
+        self.config.lines = lines
+        self.config.dwell_seconds = dwell_seconds
+
 
 class InferenceService:
     """Service managing multiple inference streams."""
 
     def __init__(self, db_path: str = "inference_data.db", event_capacity: int = 1000) -> None:
-        self.db = get_database_session(db_path)
+        # Thread-safe DB access: one engine + a scoped_session registry shared by
+        # every stream thread, each of which uses its own thread-local session.
+        self.engine, self.Session = create_session_factory(db_path)
         self.streams: Dict[str, InferenceStream] = {}
         # Bounded in-memory event history per stream (persists across stop).
         self.event_store = EventStore(capacity=event_capacity)
+        self._is_shutdown = False
 
     def start_stream(self, config: StreamConfig) -> StreamMetrics:
         """Start a new inference stream."""
+        # Drop any finished streams first, so a completed run does not block
+        # reusing its stream_id.
+        self.reap_finished()
         if config.stream_id in self.streams:
             raise ValueError(f"Stream {config.stream_id} already exists")
 
         stream = InferenceStream(
             config,
-            self.db,
+            self.Session,
             event_buffer=self.event_store.get_or_create(config.stream_id),
         )
         stream.start()
@@ -397,6 +474,33 @@ class InferenceService:
         self.streams[stream_id].stop()
         del self.streams[stream_id]
 
+    def shutdown(self) -> None:
+        """
+        Gracefully stop all streams and dispose the database engine.
+
+        Idempotent; intended to be called once from the app's lifespan
+        shutdown. Each stream is stopped cooperatively (flag flip + bounded
+        join + resource cleanup + final DB flush); one stream failing to stop
+        never blocks the others. Finally this thread's session is released and
+        every pooled connection is closed.
+        """
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
+
+        for stream_id in list(self.streams.keys()):
+            try:
+                self.stop_stream(stream_id)
+            except Exception as exc:  # noqa: BLE001 - shutdown must be resilient
+                logger.error(
+                    f"Error stopping stream {stream_id} during shutdown: {exc}"
+                )
+
+        # Release the shutdown thread's session, then close all connections.
+        self.Session.remove()
+        self.engine.dispose()
+        logger.info("Inference service shut down; database engine disposed")
+
     def get_stream_metrics(self, stream_id: str) -> StreamMetrics:
         """Get metrics for a specific stream."""
         if stream_id not in self.streams:
@@ -405,7 +509,8 @@ class InferenceService:
         return self.streams[stream_id].get_metrics()
 
     def list_streams(self) -> List[dict]:
-        """List all active streams."""
+        """List all active streams (finished ones are reaped first)."""
+        self.reap_finished()
         return [
             {
                 "stream_id": s.config.stream_id,
@@ -415,6 +520,29 @@ class InferenceService:
             }
             for s in self.streams.values()
         ]
+
+    def reap_finished(self) -> int:
+        """Remove streams whose inference loop has ended, returning the count.
+
+        A stream whose source reached EOF or errored finishes its thread and
+        sets ``is_running = False`` (and closes its own DB row via
+        ``_finalize_session``), but lingers in the registry until reaped.
+        Reaping drops it so ``list_streams`` reflects reality and its stream_id
+        can be reused. Its event history is intentionally retained in the
+        EventStore, which outlives the live stream.
+
+        Must be called only from the request/event-loop thread — the sole
+        mutator of ``self.streams`` — so no lock is needed. The joined threads
+        are already ending, so the bounded join returns effectively immediately.
+        """
+        finished = [sid for sid, st in self.streams.items() if not st.is_running]
+        for stream_id in finished:
+            stream = self.streams.pop(stream_id, None)
+            if stream is not None and stream.thread is not None:
+                stream.thread.join(timeout=1.0)
+        if finished:
+            logger.info(f"Reaped finished streams: {finished}")
+        return len(finished)
 
     def get_stream_detections(self, stream_id: str) -> List[Detection]:
         """Get latest detections from a stream."""
@@ -444,3 +572,55 @@ class InferenceService:
         if buffer is None:
             return []
         return buffer.latest(limit=limit)
+
+    def get_stream_regions(self, stream_id: str) -> Optional[dict]:
+        """Return the scene-region geometry configured on a stream, or None if
+        the stream is not active. Regions are fixed at stream start, so this is
+        exactly what the event engine is using.
+        """
+        stream = self.streams.get(stream_id)
+        if stream is None:
+            return None
+        cfg = stream.config
+        return {
+            "stream_id": stream_id,
+            "zones": [
+                {"name": z.name, "polygon": [list(point) for point in z.polygon]}
+                for z in cfg.zones
+            ],
+            "lines": [
+                {
+                    "name": ln.name,
+                    "start": list(ln.start),
+                    "end": list(ln.end),
+                    "positive_label": ln.positive_label,
+                    "negative_label": ln.negative_label,
+                }
+                for ln in cfg.lines
+            ],
+            "dwell_seconds": cfg.dwell_seconds,
+            "width": cfg.width,
+            "height": cfg.height,
+        }
+
+    def reconfigure_stream(
+        self,
+        stream_id: str,
+        zones: Tuple[Zone, ...],
+        lines: Tuple[CrossingLine, ...],
+        dwell_seconds: float,
+    ) -> dict:
+        """Apply new scene geometry to a running stream; return its new regions.
+
+        Raises ValueError if the stream is unknown or not running (the caller
+        maps that to an HTTP status). Reaps finished streams first so a stale
+        entry cannot be reconfigured.
+        """
+        self.reap_finished()
+        stream = self.streams.get(stream_id)
+        if stream is None:
+            raise ValueError(f"Stream {stream_id} not found")
+        if not stream.is_running:
+            raise ValueError(f"Stream {stream_id} is not running")
+        stream.reconfigure(zones, lines, dwell_seconds)
+        return self.get_stream_regions(stream_id)

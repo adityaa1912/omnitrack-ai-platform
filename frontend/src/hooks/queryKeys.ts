@@ -5,4 +5,6 @@ export const queryKeys = {
   streamMetrics: (streamId: string) => ["stream", streamId, "metrics"] as const,
   streamDetections: (streamId: string) =>
     ["stream", streamId, "detections"] as const,
+  streamEvents: (streamId: string) => ["stream", streamId, "events"] as const,
+  streamRegions: (streamId: string) => ["stream", streamId, "regions"] as const,
 };

@@ -1,7 +1,7 @@
 /**
  * API contract types.
  *
- * These mirror the backend Pydantic schemas in backend/app.py EXACTLY and
+ * These mirror the backend Pydantic schemas in backend/main.py EXACTLY and
  * are the single source of truth for the client/server contract. If the
  * backend contract changes, update this file first and let TypeScript
  * surface every affected call site.
@@ -60,6 +60,38 @@ export interface StartStreamRequest {
   tracking_enabled?: boolean;
   track_distance?: number;
   max_age?: number;
+  // Optional scene geometry for the event engine's zone/line detectors.
+  zones?: ZoneSpec[];
+  lines?: LineSpec[];
+  dwell_seconds?: number;
+}
+
+/**
+ * Scene-region geometry. Mirrors the backend ZoneSpec/LineSpec exactly.
+ * Coordinates are in source-frame pixels (top-left origin), the same space as
+ * detections.
+ */
+export interface ZoneSpec {
+  name: string;
+  polygon: [number, number][]; // >= 3 vertices
+}
+
+export interface LineSpec {
+  name: string;
+  start: [number, number];
+  end: [number, number];
+  positive_label?: string;
+  negative_label?: string;
+}
+
+/** Mirrors RegionsResponse (GET /stream/{id}/regions). */
+export interface RegionsResponse {
+  stream_id: string;
+  zones: ZoneSpec[];
+  lines: LineSpec[];
+  dwell_seconds: number;
+  width: number;
+  height: number;
 }
 
 /**

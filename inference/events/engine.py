@@ -9,11 +9,15 @@ Design properties:
   - Derives strictly from tracking output; never touches frames or rendering.
   - Bounded memory: per-track metadata and detector state are pruned every
     frame to the set of tracks the tracker still holds.
-  - Pure/sync: no I/O, no threads. Persistence and delivery are layered on top
-    in later commits by whoever calls `process()`.
+  - Sync, no I/O. `process()` normally runs on a single (inference) thread, but
+    `reconfigure()` may be called concurrently from another thread to change the
+    scene geometry live; a lock makes the two mutually exclusive, so a frame is
+    never derived against a half-swapped configuration.
 """
 
 from __future__ import annotations
+
+import threading
 
 from typing import Optional
 
@@ -65,13 +69,24 @@ class EventEngine:
         self._known_ids: set[int] = set()
         self._meta_by_id: dict[int, TrackMeta] = {}
 
+        # Serializes process()/reconfigure()/reset() so a live geometry change
+        # never interleaves with a frame's derivation. Uncontended in the common
+        # single-thread case (negligible cost next to detection/tracking).
+        self._lock = threading.Lock()
+
     def process(self, result: TrackingResult) -> list[Event]:
         """
         Derive events for one frame.
 
         Returns events in a stable order (appearance first, then per-detector).
         Returns an empty list when disabled, so callers need no special-casing.
+        Holds the engine lock so a concurrent `reconfigure()` cannot swap the
+        scene geometry mid-frame.
         """
+        with self._lock:
+            return self._process_locked(result)
+
+    def _process_locked(self, result: TrackingResult) -> list[Event]:
         if not self.config.enabled:
             return []
 
@@ -112,10 +127,31 @@ class EventEngine:
 
     def reset(self) -> None:
         """Clear engine and detector state (e.g. on stream restart)."""
-        self._known_ids.clear()
-        self._meta_by_id.clear()
-        for detector in self._detectors:
-            detector.reset()
+        with self._lock:
+            self._known_ids.clear()
+            self._meta_by_id.clear()
+            for detector in self._detectors:
+                detector.reset()
+
+    def reconfigure(self, config: EventEngineConfig) -> None:
+        """
+        Swap the scene geometry (zones/lines/dwell) on a running engine.
+
+        Rebuilds ONLY the geometry detectors so their per-track state matches the
+        new regions; the appearance/stationary/near-collision detectors and their
+        hysteresis are preserved, so changing regions never fires spurious
+        appeared/disappeared events. Track identity/meta is likewise preserved.
+        Thread-safe against `process()` via the engine lock, so it can be called
+        live from another thread. Only the geometry detectors are replaced, so
+        this assumes the standard detector set (as built by `default_detectors`).
+        """
+        with self._lock:
+            self.config = config
+            self._detectors = [
+                detector
+                for detector in self._detectors
+                if not isinstance(detector, (ZoneDetector, LineCrossingDetector))
+            ] + [ZoneDetector(), LineCrossingDetector()]
 
     # -- internals ----------------------------------------------------------
 

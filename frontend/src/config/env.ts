@@ -13,4 +13,7 @@ function readEnv(key: string, fallback: string): string {
 export const env = {
   apiBaseUrl: readEnv("VITE_API_BASE_URL", "/api"),
   wsBaseUrl: readEnv("VITE_WS_BASE_URL", "/ws"),
+  // Optional shared secret sent as `X-API-Key` (REST) / `?api_key=` (WS) when
+  // the backend has OMNITRACK_API_KEY set. Empty = no auth (default).
+  apiKey: readEnv("VITE_API_KEY", ""),
 } as const;

@@ -47,10 +47,14 @@ function buildUrl(path: string, query?: Record<string, QueryValue>): string {
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = "GET", body, query, signal } = options;
 
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (env.apiKey) headers["X-API-Key"] = env.apiKey;
+
   const response = await fetch(buildUrl(path, query), {
     method,
     signal,
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 
@@ -79,4 +83,6 @@ export const apiClient = {
     request<T>(path, { ...opts, method: "GET" }),
   post: <T>(path: string, opts?: Omit<RequestOptions, "method">) =>
     request<T>(path, { ...opts, method: "POST" }),
+  put: <T>(path: string, opts?: Omit<RequestOptions, "method">) =>
+    request<T>(path, { ...opts, method: "PUT" }),
 };

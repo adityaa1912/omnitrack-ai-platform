@@ -33,9 +33,10 @@ export interface StreamSocketOptions {
 function buildWsUrl(streamId: string): string {
   const base = env.wsBaseUrl.replace(/\/$/, "");
   const path = `/stream/${encodeURIComponent(streamId)}/ws`;
-  if (/^wss?:\/\//i.test(base)) return `${base}${path}`;
+  const query = env.apiKey ? `?api_key=${encodeURIComponent(env.apiKey)}` : "";
+  if (/^wss?:\/\//i.test(base)) return `${base}${path}${query}`;
   const origin = window.location.origin.replace(/^http/i, "ws");
-  return `${origin}${base}${path}`;
+  return `${origin}${base}${path}${query}`;
 }
 
 function isWsMessage(value: unknown): value is WsMessage {

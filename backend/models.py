@@ -6,9 +6,22 @@ Uses SQLAlchemy ORM for clean database abstraction.
 """
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, Float, String, DateTime, Boolean, JSON, create_engine
+from typing import Tuple
+
+from sqlalchemy import (
+    Column,
+    Integer,
+    Float,
+    String,
+    DateTime,
+    Boolean,
+    JSON,
+    create_engine,
+    event,
+)
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import scoped_session, sessionmaker
 
 Base = declarative_base()
 
@@ -83,9 +96,47 @@ class StreamSession(Base):
     error_message = Column(String, nullable=True)
 
 
-def get_database_session(db_path: str = "inference_data.db"):
-    """Create database session factory."""
-    engine = create_engine(f"sqlite:///{db_path}", echo=False)
+def create_session_factory(
+    db_path: str = "inference_data.db",
+) -> Tuple[Engine, scoped_session]:
+    """
+    Build a thread-safe session factory for the given SQLite database.
+
+    Returns ``(engine, Session)`` where ``Session`` is a ``scoped_session``
+    registry. Calling ``Session()`` returns the *current thread's* Session — the
+    only supported way to use SQLAlchemy across threads, since a ``Session`` must
+    never be shared between threads. Every thread that uses the registry MUST
+    call ``Session.remove()`` when it is done so its thread-local session (and
+    the connection it holds) is released.
+
+    SQLite specifics that make concurrent inference threads safe:
+      - ``check_same_thread=False``: the pool may hand a connection to whichever
+        thread checks it out; paired with per-thread sessions this is safe.
+      - WAL journaling + ``busy_timeout``: SQLite permits a single writer at a
+        time. WAL lets readers proceed while a writer is active, and
+        ``busy_timeout`` makes a contending writer wait for the lock instead of
+        failing immediately with "database is locked". ``synchronous=NORMAL`` is
+        the standard, durable-enough companion to WAL.
+
+    The caller owns the returned engine and is responsible for
+    ``engine.dispose()`` at shutdown.
+    """
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        echo=False,
+        connect_args={"check_same_thread": False},
+    )
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
+
     Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    return Session()
+    Session = scoped_session(sessionmaker(bind=engine))
+    return engine, Session

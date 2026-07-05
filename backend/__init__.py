@@ -9,13 +9,16 @@ Provides REST API and WebSocket support for:
 """
 
 from .service import InferenceService, InferenceStream, StreamConfig, StreamMetrics
-from .models import Detection, Metric, StreamSession, get_database_session
-from .app import app
+from .models import Detection, Metric, StreamSession, create_session_factory
+
+# The FastAPI app is intentionally NOT imported here, so importing `backend`
+# (e.g. `backend.models` from Alembic's env.py) never constructs the service or
+# creates database tables as an import side effect. Get the app explicitly via
+# `from backend.main import app` (as run.py and uvicorn do).
 
 __version__ = "0.3.0"
 
 __all__ = [
-    "app",
     "InferenceService",
     "InferenceStream",
     "StreamConfig",
@@ -23,5 +26,5 @@ __all__ = [
     "Detection",
     "Metric",
     "StreamSession",
-    "get_database_session",
+    "create_session_factory",
 ]

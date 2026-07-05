@@ -21,7 +21,10 @@ export async function decodeJpegBase64(
 ): Promise<ImageBitmap | null> {
   if (isDisposed()) return null;
   const bytes = base64ToBytes(base64);
-  const blob = new Blob([bytes], { type: "image/jpeg" });
+  // `bytes as BlobPart`: newer lib.dom types Uint8Array as generic over
+  // ArrayBufferLike, which no longer structurally matches BlobPart. This is a
+  // type-only assertion (no runtime effect); the bytes are a valid Blob part.
+  const blob = new Blob([bytes as BlobPart], { type: "image/jpeg" });
   const bitmap = await createImageBitmap(blob);
   if (isDisposed()) {
     bitmap.close();

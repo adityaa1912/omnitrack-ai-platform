@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Square } from "lucide-react";
+import { Link } from "react-router-dom";
+import { ArrowUpRight, Square } from "lucide-react";
 import type { StreamSummary } from "@/types/api";
 import { Panel } from "@/components/ui/Panel";
 import { Button } from "@/components/ui/Button";
@@ -62,15 +63,24 @@ export function StreamCard({ stream }: { stream: StreamSummary }) {
         <span className="text-[10px] uppercase tracking-wide text-content-muted">
           {is_running ? "running" : "stopped"}
         </span>
-        <Button
-          variant="danger"
-          size="sm"
-          onClick={handleStop}
-          disabled={stopping || !is_running}
-        >
-          {stopping ? <Spinner className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
-          {stopping ? "Stopping" : "Stop"}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Link
+            to={`/streams/${encodeURIComponent(stream_id)}`}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs font-medium text-content-secondary transition-colors hover:bg-surface-200 hover:text-content-primary"
+          >
+            <ArrowUpRight className="h-3.5 w-3.5" />
+            Open
+          </Link>
+          <Button
+            variant="danger"
+            size="sm"
+            onClick={handleStop}
+            disabled={stopping || !is_running}
+          >
+            {stopping ? <Spinner className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+            {stopping ? "Stopping" : "Stop"}
+          </Button>
+        </div>
       </div>
     </Panel>
   );

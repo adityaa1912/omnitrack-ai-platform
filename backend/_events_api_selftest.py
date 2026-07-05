@@ -3,7 +3,7 @@ Targeted self-test for the event-history REST API (Commit 3C).
 
 Run with:  python -m backend._events_api_selftest
 
-Importing this module imports `backend.app`, which is itself the import-check:
+Importing this module imports `backend.main`, which is itself the import-check:
 it constructs the FastAPI app and the InferenceService. The tests then:
   - assert the new GET /stream/{stream_id}/events route is registered,
   - assert the existing routes are still present (regression guard),
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 
-from .app import (
+from .main import (
     DEFAULT_EVENT_LIMIT,
     MAX_EVENT_LIMIT,
     EventResponse,

@@ -12,7 +12,7 @@ import logging
 
 import uvicorn
 
-from backend.app import app
+from backend.main import app
 
 
 logging.basicConfig(

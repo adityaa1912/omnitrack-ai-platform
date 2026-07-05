@@ -6,20 +6,25 @@ Provides WebSocket for real-time frame streaming.
 """
 
 import asyncio
+import hmac
 import logging
+import os
 import base64
 import cv2
 import numpy as np
-from typing import Optional, List
+from contextlib import asynccontextmanager
+from typing import Optional, List, Tuple
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import numpy as np
 
 from .service import InferenceService, StreamConfig, StreamMetrics
 from inference.types import Detection as InferenceDetection
+from inference.events.regions import Zone, CrossingLine
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,73 @@ def _to_native(value):
     return value
 
 
+def _cors_config() -> tuple[list[str], bool]:
+    """Resolve CORS allowed origins from the environment.
+
+    ``OMNITRACK_CORS_ORIGINS`` is a comma-separated list of allowed origins;
+    unset or empty defaults to ``*`` (permissive, suitable for local dev, e.g.
+    ``OMNITRACK_CORS_ORIGINS=https://app.example.com,https://admin.example.com``).
+
+    Per the CORS spec a wildcard origin and credentials are mutually exclusive
+    (browsers reject ``Access-Control-Allow-Origin: *`` with credentials), so
+    credentials are enabled only when explicit origins are configured. If ``*``
+    appears anywhere in the list it wins (wildcard, credentials off).
+    """
+    raw = os.environ.get("OMNITRACK_CORS_ORIGINS", "*")
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    if not origins or "*" in origins:
+        return ["*"], False
+    return origins, True
+
+
+# ---- API-key access control (opt-in) --------------------------------------
+# Set OMNITRACK_API_KEY to require callers to present the same value via the
+# `X-API-Key` header (REST) or `?api_key=` query param (WebSocket). Unset leaves
+# the API open (unchanged local-dev behavior).
+# NOTE: a browser SPA that embeds the key exposes it to end users, so this is a
+# shared-secret gate for locked-down deployments and non-browser clients — not a
+# substitute for real user authentication.
+API_KEY = os.environ.get("OMNITRACK_API_KEY", "").strip() or None
+
+# Paths that never require a key (health checks, docs, service root).
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/", "/docs", "/redoc", "/openapi.json"})
+
+
+def _check_api_key(provided: Optional[str]) -> bool:
+    """Return True if the request is authorized.
+
+    Auth is opt-in: when ``API_KEY`` is unset every request passes. When set,
+    the caller must present the same value, compared in constant time to avoid
+    timing leaks.
+    """
+    if API_KEY is None:
+        return True
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, API_KEY)
+
+
+def _build_geometry(zone_specs, line_specs):
+    """Translate region specs into inference ``Zone``/``CrossingLine`` objects.
+
+    Raises ``ValueError`` (from the inference constructors' own validation) on
+    invalid geometry — callers map that to HTTP 422. Shared by the start and
+    live-reconfigure endpoints so the translation lives in exactly one place.
+    """
+    zones = tuple(Zone(name=s.name, polygon=s.polygon) for s in zone_specs)
+    lines = tuple(
+        CrossingLine(
+            name=s.name,
+            start=s.start,
+            end=s.end,
+            positive_label=s.positive_label,
+            negative_label=s.negative_label,
+        )
+        for s in line_specs
+    )
+    return zones, lines
+
+
 # Event history query bounds (read from the in-memory event store).
 DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 1000
@@ -41,26 +113,92 @@ MAX_EVENT_LIMIT = 1000
 # Initialize service
 service = InferenceService(db_path="inference_data.db")
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """
+    Application lifespan.
+
+    Startup is a no-op — the inference service is constructed at import. On
+    shutdown (SIGINT/SIGTERM/uvicorn reload) we stop every running inference
+    thread, release frame sources, flush pending DB writes, and dispose the
+    database engine so nothing leaks and stream sessions are closed out.
+    `service.shutdown()` blocks on bounded per-stream joins, so it runs in a
+    worker thread to avoid stalling the event loop during teardown.
+    """
+    yield
+    logger.info("Application shutdown: stopping streams and disposing resources")
+    await asyncio.to_thread(service.shutdown)
+
+
 # Create FastAPI app
 app = FastAPI(
     title="YOLOv8 Inference API",
     description="Real-time object detection with multi-object tracking",
     version="0.3.0",
+    lifespan=lifespan,
 )
 
-# Enable CORS for frontend integration
+# Enable CORS for frontend integration. Origins are configurable via
+# OMNITRACK_CORS_ORIGINS (comma-separated); defaults to '*' for local dev.
+_cors_origins, _cors_allow_credentials = _cors_config()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):
+    """Enforce the API key on HTTP routes when auth is enabled.
+
+    Exempts CORS preflight (OPTIONS carries no custom headers) and the public
+    paths. WebSocket handshakes use the ``websocket`` ASGI scope and bypass HTTP
+    middleware, so they are authorized inside their handlers instead.
+    """
+    if (
+        API_KEY is not None
+        and request.method != "OPTIONS"
+        and request.url.path not in _AUTH_EXEMPT_PATHS
+    ):
+        if not _check_api_key(request.headers.get("x-api-key")):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key"},
+            )
+    return await call_next(request)
+
+
 # ============================================================================
 # Pydantic Models (Request/Response schemas)
 # ============================================================================
+
+class ZoneSpec(BaseModel):
+    """A named polygonal zone (>= 3 vertices, pixel coordinates).
+
+    Drives OBJECT_ENTERED / OBJECT_EXITED / DWELL_TIME events. The vertex-count
+    and coordinate validation is enforced by the inference `Zone` type, so this
+    schema only pins the wire shape.
+    """
+    name: str
+    polygon: List[Tuple[float, float]]
+
+
+class LineSpec(BaseModel):
+    """A named directed tripwire for CROSSING_DIRECTION events.
+
+    `positive_label` / `negative_label` name the two crossing directions; the
+    start->end order fixes which physical direction each label means.
+    """
+    name: str
+    start: Tuple[float, float]
+    end: Tuple[float, float]
+    positive_label: str = "positive"
+    negative_label: str = "negative"
+
 
 class StartStreamRequest(BaseModel):
     """Request to start a new inference stream."""
@@ -73,6 +211,13 @@ class StartStreamRequest(BaseModel):
     tracking_enabled: bool = True
     track_distance: float = 50.0
     max_age: int = 30
+
+    # Optional scene geometry for the event engine's zone/line detectors. Empty
+    # (the default) leaves those detectors inert, so an unconfigured stream
+    # behaves exactly as before. Requires tracking_enabled=True to have effect.
+    zones: List[ZoneSpec] = Field(default_factory=list)
+    lines: List[LineSpec] = Field(default_factory=list)
+    dwell_seconds: float = Field(default=5.0, gt=0)
 
 
 class DetectionResponse(BaseModel):
@@ -104,6 +249,34 @@ class StreamResponse(BaseModel):
     source: str
     is_running: bool
     metrics: MetricsResponse
+
+
+class RegionsResponse(BaseModel):
+    """The scene-region geometry configured on a stream's event engine.
+
+    Reuses the request specs as the response shape (the contract is symmetric:
+    what you POST at start is what you GET back). Regions are fixed at stream
+    start, so this reflects exactly what the engine is using.
+    """
+    stream_id: str
+    zones: List[ZoneSpec]
+    lines: List[LineSpec]
+    dwell_seconds: float
+    # Source frame dimensions the region coordinates are expressed in, so a
+    # client can render regions in the correct pixel space (e.g. an overlay).
+    width: int
+    height: int
+
+
+class RegionsUpdateRequest(BaseModel):
+    """Body for PUT /stream/{id}/regions — replaces a running stream's geometry.
+
+    Same shape as the start-request geometry fields. Coordinates are in the
+    stream's source-frame pixel space (unchanged by this call).
+    """
+    zones: List[ZoneSpec] = Field(default_factory=list)
+    lines: List[LineSpec] = Field(default_factory=list)
+    dwell_seconds: float = Field(default=5.0, gt=0)
 
 
 class EventResponse(BaseModel):
@@ -151,6 +324,14 @@ async def health():
 @app.post("/stream/start", response_model=MetricsResponse)
 async def start_stream(request: StartStreamRequest):
     """Start a new inference stream."""
+    # Translate scene-region specs into inference geometry up front, so invalid
+    # geometry is rejected (422) before any stream resource is opened. This
+    # reuses the inference layer's own validation as the single source of truth.
+    try:
+        zones, lines = _build_geometry(request.zones, request.lines)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     try:
         config = StreamConfig(
             stream_id=request.stream_id,
@@ -162,6 +343,9 @@ async def start_stream(request: StartStreamRequest):
             tracking_enabled=request.tracking_enabled,
             track_distance=request.track_distance,
             max_age=request.max_age,
+            zones=zones,
+            lines=lines,
+            dwell_seconds=request.dwell_seconds,
         )
         metrics = service.start_stream(config)
 
@@ -264,6 +448,44 @@ async def get_events(
     return [EventResponse(**event) for event in events]
 
 
+@app.get("/stream/{stream_id}/regions", response_model=RegionsResponse)
+async def get_regions(stream_id: str):
+    """Return the scene-region geometry configured on a stream (zones/lines).
+
+    404 if the stream is not active. Regions are fixed at stream start, so this
+    reflects exactly what the event engine is using.
+    """
+    regions = service.get_stream_regions(stream_id)
+    if regions is None:
+        raise HTTPException(status_code=404, detail=f"Stream {stream_id} not found")
+    return regions
+
+
+@app.put("/stream/{stream_id}/regions", response_model=RegionsResponse)
+async def update_regions(stream_id: str, request: RegionsUpdateRequest):
+    """Replace a running stream's scene regions live — no restart.
+
+    Rebuilds the event engine's geometry detectors in place (existing tracks are
+    preserved, so this never re-fires appearance events). Returns the updated
+    regions. Status codes: 422 invalid geometry; 404 stream not active; 409 the
+    stream is not running or has tracking disabled.
+    """
+    try:
+        zones, lines = _build_geometry(request.zones, request.lines)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if service.get_stream_regions(stream_id) is None:
+        raise HTTPException(status_code=404, detail=f"Stream {stream_id} not found")
+
+    try:
+        return service.reconfigure_stream(
+            stream_id, zones, lines, request.dwell_seconds
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.get("/streams", response_model=List[StreamResponse])
 async def list_streams():
     """List all active streams."""
@@ -300,6 +522,10 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
     Sends JPEG-encoded frames as binary data with detection overlays.
     Client can subscribe to a stream and receive frames in real-time.
     """
+    if not _check_api_key(websocket.query_params.get("api_key")):
+        await websocket.close(code=1008)  # policy violation
+        return
+
     await websocket.accept()
 
     logger.info(f"WebSocket client connected to stream {stream_id}")
@@ -387,6 +613,10 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
       - The subscription is always torn down on disconnect (the `finally`), so a
         departed client leaves no callback registered on the buffer.
     """
+    if not _check_api_key(websocket.query_params.get("api_key")):
+        await websocket.close(code=1008)  # policy violation
+        return
+
     await websocket.accept()
     logger.info(f"Event WebSocket client connected to stream {stream_id}")
 
@@ -498,6 +728,8 @@ async def root():
             "GET /stream/{stream_id}/metrics": "Get stream metrics",
             "GET /stream/{stream_id}/detections": "Get latest detections",
             "GET /stream/{stream_id}/events": "Get recent derived events (newest-first)",
+            "GET /stream/{stream_id}/regions": "Get configured scene regions (zones/lines)",
+            "PUT /stream/{stream_id}/regions": "Update scene regions live (running stream)",
             "GET /streams": "List all active streams",
             "WS /stream/{stream_id}/ws": "Real-time frame streaming",
             "WS /stream/{stream_id}/events/ws": "Real-time event streaming",

@@ -20,8 +20,9 @@ class EventType(str, Enum):
 
     String-valued so it serializes cleanly to JSON and to a SQL column without
     a custom encoder. The four geometry-dependent types (ENTERED, EXITED,
-    CROSSING_DIRECTION, DWELL_TIME) are declared here for a stable contract but
-    are not produced until the geometry detectors land in a later commit.
+    CROSSING_DIRECTION, DWELL_TIME) are produced by the zone/line detectors when
+    a stream is started with scene regions configured; without regions those
+    detectors stay inert and only the config-free types are emitted.
     """
 
     OBJECT_APPEARED = "object_appeared"
