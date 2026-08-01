@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
-from queue import Queue
+from queue import Queue, Full
 import numpy as np
 
 from inference import (
@@ -37,9 +37,12 @@ from inference.events import EventEngine, EventEngineConfig
 from inference.events.regions import CrossingLine, Zone
 from .models import Detection as DetectionRecord, StreamSession, create_session_factory
 from .event_store import EventStore
+from .observability import correlation, metrics
+from .observability.errors import log_error
+from .observability.logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, component="inference.stream")
 
 
 def _to_python_type(value):
@@ -246,6 +249,9 @@ class InferenceStream:
 
     def _run(self) -> None:
         """Main inference loop (runs in background thread)."""
+        # Pin this stream's identity to the thread's correlation context so
+        # every log record emitted here carries its stream_id.
+        correlation.bind_stream_context(stream_id=self.config.stream_id)
         # This thread's own database session (see `create_session_factory`);
         # confined to this thread and released in the `finally` below.
         db = self._session_factory()
@@ -256,6 +262,7 @@ class InferenceStream:
                 if not self.is_running:
                     break
 
+                frame_start = time.perf_counter()
                 try:
                     # Run inference
                     result = self.detector.predict(frame)
@@ -299,8 +306,26 @@ class InferenceStream:
                             "detections": result.detections,
                             "timestamp": frame.timestamp,
                         })
-                    except:
-                        pass  # Queue full, drop frame
+                    except Full:
+                        # Queue full -> drop the frame and count it. Contained
+                        # deliberately so a slow consumer never back-pressures
+                        # the inference loop; the drop is recorded, not silent.
+                        metrics.DROPPED_FRAMES_TOTAL.labels(
+                            stream_id=self.config.stream_id
+                        ).inc()
+
+                    # Record per-frame pipeline metrics (queue depth sampled
+                    # after the put/drop so it reflects the current state).
+                    frame_latency_ms = (time.perf_counter() - frame_start) * 1000.0
+                    metrics.FRAME_QUEUE_DEPTH.labels(
+                        stream_id=self.config.stream_id
+                    ).set(self.output_queue.qsize())
+                    metrics.observe_inference(
+                        stream_id=self.config.stream_id,
+                        inference_time_ms=result.inference_time_ms,
+                        frame_latency_ms=frame_latency_ms,
+                        num_detections=len(result.detections),
+                    )
 
                     # Derive events AFTER the frame has been queued, so event
                     # generation sits off the frame-delivery path and can never
@@ -310,7 +335,15 @@ class InferenceStream:
                         self._process_events(tracking_result)
 
                 except Exception as e:
-                    logger.error(f"Error in inference loop: {e}", exc_info=True)
+                    log_error(
+                        logger,
+                        e,
+                        f"Error in inference loop for {self.config.stream_id}",
+                        stream_id=self.config.stream_id,
+                    )
+                    metrics.STREAM_ERRORS_TOTAL.labels(
+                        stream_id=self.config.stream_id
+                    ).inc()
                     self.metrics.is_active = False
                     self.metrics.error_message = str(e)
                     break
@@ -324,6 +357,7 @@ class InferenceStream:
             self._session_factory.remove()
             self.is_running = False
             self._cleanup()
+            correlation.clear_stream_context()
             logger.info(f"Inference loop finished for {self.config.stream_id}")
 
     def _finalize_session(self, db) -> None:
@@ -370,11 +404,24 @@ class InferenceStream:
         try:
             events = self.event_engine.process(tracking_result)
             if events:
-                self.event_buffer.extend(event.to_dict() for event in events)
+                stored = self.event_buffer.extend(event.to_dict() for event in events)
+                # Record event throughput, partitioned by type and severity, and
+                # stamp a correlation event id onto each stored record.
+                for record in stored:
+                    correlation.bind_event_id()
+                    metrics.EVENTS_TOTAL.labels(
+                        stream_id=self.config.stream_id,
+                        event_type=str(record.get("event_type", "unknown")),
+                        severity=str(record.get("severity", "unknown")),
+                    ).inc()
         except Exception as exc:
-            logger.error(
-                f"Event processing error for stream {self.config.stream_id}: {exc}",
-                exc_info=True,
+            # Contained deliberately: event derivation must never kill the
+            # inference loop. Logged structured with traceback, not swallowed.
+            log_error(
+                logger,
+                exc,
+                f"Event processing error for stream {self.config.stream_id}",
+                stream_id=self.config.stream_id,
             )
 
     def _update_metrics(self, inference_time_ms: float, num_detections: int) -> None:
@@ -488,6 +535,8 @@ class InferenceService:
         stream.start()
         with self._streams_lock:
             self.streams[config.stream_id] = stream
+            metrics.ACTIVE_STREAMS.set(len(self.streams))
+        metrics.STREAMS_STARTED_TOTAL.inc()
 
         return stream.get_metrics()
 
@@ -508,6 +557,8 @@ class InferenceService:
                 if self.streams.get(stream_id) is stream:
                     self.streams.pop(stream_id, None)
                 self._stopping.discard(stream_id)
+                metrics.ACTIVE_STREAMS.set(len(self.streams))
+            metrics.STREAMS_STOPPED_TOTAL.inc()
 
     def has_stream(self, stream_id: str) -> bool:
         """Return whether ``stream_id`` is still registered as live."""
@@ -532,13 +583,18 @@ class InferenceService:
             try:
                 self.stop_stream(stream_id)
             except Exception as exc:  # noqa: BLE001 - shutdown must be resilient
-                logger.error(
-                    f"Error stopping stream {stream_id} during shutdown: {exc}"
+                log_error(
+                    logger,
+                    exc,
+                    f"Error stopping stream {stream_id} during shutdown",
+                    stream_id=stream_id,
                 )
 
         # Release the shutdown thread's session, then close all connections.
         self.Session.remove()
         self.engine.dispose()
+        with self._streams_lock:
+            metrics.ACTIVE_STREAMS.set(0)
         logger.info("Inference service shut down; database engine disposed")
 
     def get_stream_metrics(self, stream_id: str) -> StreamMetrics:
@@ -582,6 +638,8 @@ class InferenceService:
                 if sid not in self._stopping and not st.is_running
             ]
             finished_streams = [self.streams.pop(stream_id) for stream_id in finished]
+            if finished:
+                metrics.ACTIVE_STREAMS.set(len(self.streams))
         for stream in finished_streams:
             if stream is not None and stream.thread is not None:
                 stream.thread.join(timeout=1.0)

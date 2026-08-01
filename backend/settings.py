@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     api_key: str | None = None
 
+    # Observability. Metrics are always exposed at /metrics (Prometheus text
+    # format); the system sampler interval controls how often process CPU /
+    # memory / thread gauges are refreshed off the request path.
+    metrics_enabled: bool = True
+    metrics_system_sample_interval_seconds: float = Field(default=5.0, gt=0)
+    # Header name consulted for an incoming correlation/request id. When absent
+    # or empty, a fresh id is generated. The id is always echoed back on the
+    # ``X-Request-ID`` response header.
+    request_id_header: str = Field(default="X-Request-ID", min_length=1)
+
     healthcheck_interval_seconds: int = Field(default=30, ge=1)
     healthcheck_timeout_seconds: int = Field(default=5, ge=1)
     healthcheck_start_period_seconds: int = Field(default=20, ge=0)

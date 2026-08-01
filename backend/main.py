@@ -8,6 +8,7 @@ Provides WebSocket for real-time frame streaming.
 import asyncio
 import hmac
 import logging
+import time
 import base64
 import cv2
 import numpy as np
@@ -17,18 +18,27 @@ from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field
 
 from .service import InferenceService, StreamConfig, StreamMetrics
 from .settings import get_settings
+from .observability import correlation
+from .observability import metrics as om
+from .observability.errors import log_error
+from .observability.logging import configure_logging, get_logger, shutdown_logging
+from .observability.readiness import CheckResult, ReadinessProbe, SystemSampler
 from inference.types import Detection as InferenceDetection
 from inference.events.regions import Zone, CrossingLine
 
 
-logger = logging.getLogger(__name__)
+# Configure structured JSON logging before anything else logs, so every record
+# (including uvicorn's) is emitted as JSON. Idempotent.
 settings = get_settings()
+configure_logging(settings.logging_level)
+
+logger = get_logger(__name__, component="backend.api")
 
 
 def _to_native(value):
@@ -117,6 +127,81 @@ service = InferenceService(
     event_capacity=settings.event_buffer_capacity,
 )
 
+# ---------------------------------------------------------------------------
+# Observability: readiness probe + background system sampler.
+# ---------------------------------------------------------------------------
+
+readiness_probe = ReadinessProbe()
+system_sampler = SystemSampler(
+    interval_seconds=settings.metrics_system_sample_interval_seconds
+)
+
+
+def _check_model_available() -> CheckResult:
+    """Readiness: the inference model file must be present and loadable.
+
+    We check that the configured model path exists (cheap) rather than loading
+    the model on every probe. A stream that already constructed its Detector is
+    proof of loadability; for the not-yet-started case the file's presence is
+    the gate.
+    """
+    import os
+
+    path = settings.model_path
+    if os.path.exists(path):
+        return CheckResult(name="model", ok=True, detail=f"model file present: {path}")
+    return CheckResult(name="model", ok=False, detail=f"model file missing: {path}")
+
+
+def _check_stream_manager() -> CheckResult:
+    """Readiness: the stream manager must be constructed and not shut down."""
+    if service is None:
+        return CheckResult(name="stream_manager", ok=False, detail="not initialized")
+    if getattr(service, "_is_shutdown", False):
+        return CheckResult(name="stream_manager", ok=False, detail="shut down")
+    return CheckResult(
+        name="stream_manager", ok=True, detail=f"{len(service.streams)} active"
+    )
+
+
+def _check_database() -> CheckResult:
+    """Readiness: the database must accept a trivial round-trip.
+
+    Uses a short ``SELECT 1`` on a fresh connection so a locked/corrupt/missing
+    database surfaces as not-ready without disturbing pooled connections.
+    """
+    try:
+        from sqlalchemy import text
+
+        with service.engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return CheckResult(name="database", ok=True, detail="reachable")
+    except Exception as exc:  # noqa: BLE001 - a failing check is data
+        return CheckResult(name="database", ok=False, detail=str(exc))
+
+
+def _check_configuration() -> CheckResult:
+    """Readiness: settings must be constructible and internally valid.
+
+    ``get_settings`` is cached and validated by pydantic at import; reaching
+    this check means configuration loaded. We additionally confirm the resolved
+    sqlite path is set (the model validator guarantees it).
+    """
+    try:
+        if not settings.sqlite_path:
+            return CheckResult(
+                name="configuration", ok=False, detail="sqlite_path unresolved"
+            )
+        return CheckResult(name="configuration", ok=True, detail="valid")
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(name="configuration", ok=False, detail=str(exc))
+
+
+readiness_probe.register(_check_configuration)
+readiness_probe.register(_check_model_available)
+readiness_probe.register(_check_stream_manager)
+readiness_probe.register(_check_database)
+
 
 class StreamWebSocketManager:
     """Coordinate live WebSocket handlers with a stream's lifecycle.
@@ -166,17 +251,30 @@ async def lifespan(_app: FastAPI):
     """
     Application lifespan.
 
-    Startup is a no-op — the inference service is constructed at import. On
-    shutdown (SIGINT/SIGTERM/uvicorn reload) we stop every running inference
-    thread, release frame sources, flush pending DB writes, and dispose the
-    database engine so nothing leaks and stream sessions are closed out.
-    `service.shutdown()` blocks on bounded per-stream joins, so it runs in a
-    worker thread to avoid stalling the event loop during teardown.
+    Startup records build metadata and starts the background system sampler.
+    On shutdown (SIGINT/SIGTERM/uvicorn reload) we stop every running inference
+    thread, release frame sources, flush pending DB writes, dispose the
+    database engine, stop the sampler, and flush the logging queue so nothing
+    leaks and no buffered log record is lost. `service.shutdown()` blocks on
+    bounded per-stream joins, so it runs in a worker thread to avoid stalling
+    the event loop during teardown.
     """
-    yield
-    logger.info("Application shutdown: stopping streams and disposing resources")
-    stream_websockets.close_all()
-    await asyncio.to_thread(service.shutdown)
+    om.BUILD_INFO.labels(
+        version=app.version, environment=settings.environment
+    ).set(1)
+    system_sampler.start()
+    logger.info(
+        "Application startup: observability initialized",
+        extra={"fields": {"environment": settings.environment}},
+    )
+    try:
+        yield
+    finally:
+        logger.info("Application shutdown: stopping streams and disposing resources")
+        stream_websockets.close_all()
+        await asyncio.to_thread(service.shutdown)
+        system_sampler.stop()
+        shutdown_logging()
 
 
 # Create FastAPI app
@@ -218,6 +316,58 @@ async def _api_key_middleware(request: Request, call_next):
                 content={"detail": "Invalid or missing API key"},
             )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _observability_middleware(request: Request, call_next):
+    """Bind a correlation id and record API metrics for every HTTP request.
+
+    Runs for every request (including exempt paths). It:
+      1. Binds a request id — honouring an inbound ``X-Request-ID`` header when
+         present so callers can supply their own correlation id — into the
+         request's context, so every log record emitted while handling it
+         carries the id.
+      2. Times the request and records latency + count into Prometheus,
+         partitioned by method, route template, and status class.
+      3. Echoes the request id back on the ``X-Request-ID`` response header.
+
+    The route template (``request.scope["route"].path``) is used as the label
+    value rather than the raw path, so path parameters (e.g. ``stream_id``) do
+    not explode label cardinality. Unmatched routes fall back to the raw path.
+    """
+    inbound = request.headers.get(settings.request_id_header)
+    request_id = correlation.bind_request_id(inbound or None)
+
+    om.API_REQUESTS_IN_FLIGHT.inc()
+    start = time.perf_counter()
+    status_code = 500  # assume failure until a response says otherwise
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed = time.perf_counter() - start
+        om.API_REQUESTS_IN_FLIGHT.dec()
+
+        # Resolve the route template for a low-cardinality label.
+        route = request.scope.get("route")
+        route_label = getattr(route, "path", None) or request.url.path
+        sclass = om.status_class(status_code)
+
+        om.API_REQUEST_LATENCY.labels(
+            method=request.method, route=route_label, status_class=sclass
+        ).observe(elapsed)
+        om.API_REQUESTS_TOTAL.labels(
+            method=request.method, route=route_label, status_class=sclass
+        ).inc()
+
+        # Echo the correlation id back to the caller.
+        # ``call_next`` may have raised; only set the header when we have a
+        # response object to mutate.
+        if "response" in locals() and response is not None:
+            response.headers[settings.request_id_header] = request_id
+
+        correlation.clear_request_id()
 
 
 # ============================================================================
@@ -361,11 +511,60 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Service health check endpoint."""
+    """Service health check endpoint (legacy aggregate, kept for compatibility)."""
     return HealthResponse(
         status="healthy",
         timestamp=datetime.utcnow(),
         active_streams=len(service.streams),
+    )
+
+
+@app.get("/live")
+async def liveness():
+    """Liveness probe: is the process up and its event loop responsive?
+
+    Intentionally cheap and dependency-free — it never touches the model,
+    database, or stream manager, so it only fails when the process itself is
+    wedged. Orchestrators should restart the container when this fails.
+    """
+    return {"status": "alive", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.get("/ready")
+async def readiness():
+    """Readiness probe: can the service do useful work right now?
+
+    Evaluates every registered dependency check (configuration, model, stream
+    manager, database). Returns HTTP 200 when all pass, else HTTP 503 with a
+    per-check breakdown so an operator can see exactly which dependency is
+    not ready. Orchestrators should withhold traffic until this returns 200.
+    """
+    report = readiness_probe.evaluate()
+    status_code = 200 if report.ready else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ready" if report.ready else "not_ready",
+            "timestamp": datetime.utcnow().isoformat(),
+            **report.to_dict(),
+        },
+    )
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus metrics exposition (text format).
+
+    Returns the full registry in the Prometheus text exposition format. This
+    endpoint is intentionally unauthenticated-exempt-adjacent but still passes
+    through the API-key middleware when auth is enabled; scrape configs should
+    present the key if one is configured.
+    """
+    if not settings.metrics_enabled:
+        raise HTTPException(status_code=404, detail="metrics disabled")
+    return Response(
+        content=om.render_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
     )
 
 
@@ -590,7 +789,15 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
         return
 
     await websocket.accept()
-    logger.info(f"WebSocket client connected to stream {stream_id}")
+    # Bind stream context so every log record on this connection carries the
+    # stream id, and track the live connection in metrics.
+    correlation.bind_stream_context(stream_id=stream_id)
+    om.WS_CONNECTIONS.labels(channel="frames").inc()
+    om.WS_CONNECTIONS_TOTAL.labels(channel="frames").inc()
+    logger.info(
+        f"WebSocket client connected to stream {stream_id}",
+        extra={"fields": {"channel": "frames"}},
+    )
     stop_event = stream_websockets.register(stream_id)
 
     async def _watch_disconnect() -> None:
@@ -646,6 +853,9 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
 
             if frame_data is None:
                 await websocket.send_json({"type": "keep_alive"})
+                om.WS_MESSAGES_SENT_TOTAL.labels(
+                    channel="frames", type="keep_alive"
+                ).inc()
                 continue
 
             frame = frame_data["frame"]
@@ -676,6 +886,9 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
                     for d in frame_data["detections"]
                 ],
             })
+            om.WS_MESSAGES_SENT_TOTAL.labels(
+                channel="frames", type="frame"
+            ).inc()
     except WebSocketDisconnect:
         logger.info(f"WebSocket client disconnected from stream {stream_id}")
     finally:
@@ -687,6 +900,8 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
             return_exceptions=True,
         )
         stream_websockets.unregister(stream_id, stop_event)
+        om.WS_CONNECTIONS.labels(channel="frames").dec()
+        correlation.clear_stream_context()
 
 
 # ============================================================================
@@ -727,7 +942,13 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
         return
 
     await websocket.accept()
-    logger.info(f"Event WebSocket client connected to stream {stream_id}")
+    correlation.bind_stream_context(stream_id=stream_id)
+    om.WS_CONNECTIONS.labels(channel="events").inc()
+    om.WS_CONNECTIONS_TOTAL.labels(channel="events").inc()
+    logger.info(
+        f"Event WebSocket client connected to stream {stream_id}",
+        extra={"fields": {"channel": "events"}},
+    )
     stop_event = stream_websockets.register(stream_id)
 
     # Do not create an EventBuffer for an unknown/deleted stream.  Register
@@ -737,6 +958,8 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
             await _close_stopped_stream_socket(websocket)
         finally:
             stream_websockets.unregister(stream_id, stop_event)
+            om.WS_CONNECTIONS.labels(channel="events").dec()
+            correlation.clear_stream_context()
         return
 
     buffer = service.event_store.get(stream_id)
@@ -745,6 +968,8 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
             await _close_stopped_stream_socket(websocket)
         finally:
             stream_websockets.unregister(stream_id, stop_event)
+            om.WS_CONNECTIONS.labels(channel="events").dec()
+            correlation.clear_stream_context()
         return
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_WS_QUEUE_MAXSIZE)
@@ -770,6 +995,7 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
             except asyncio.QueueEmpty:
                 pass
             dropped_since_gap += 1
+            om.DROPPED_EVENTS_TOTAL.labels(stream_id=stream_id).inc()
             try:
                 queue.put_nowait(record)
             except asyncio.QueueFull:  # pragma: no cover - defensive
@@ -798,7 +1024,13 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
                 missed = dropped_since_gap
                 dropped_since_gap = 0
                 await websocket.send_json({"type": "gap", "dropped": missed})
+                om.WS_MESSAGES_SENT_TOTAL.labels(
+                    channel="events", type="gap"
+                ).inc()
             await websocket.send_json({"type": "event", "event": record})
+            om.WS_MESSAGES_SENT_TOTAL.labels(
+                channel="events", type="event"
+            ).inc()
 
     async def _watch_disconnect() -> None:
         """Surface a client disconnect even when no events are flowing.
@@ -837,6 +1069,8 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
         # Retrieve every outcome so cancelled/send tasks never leak warnings.
         await asyncio.gather(send_task, watch_task, stop_task, return_exceptions=True)
         stream_websockets.unregister(stream_id, stop_event)
+        om.WS_CONNECTIONS.labels(channel="events").dec()
+        correlation.clear_stream_context()
         logger.info(f"Event WebSocket client disconnected from stream {stream_id}")
 
 
@@ -864,6 +1098,9 @@ async def root():
             "WS /stream/{stream_id}/ws": "Real-time frame streaming",
             "WS /stream/{stream_id}/events/ws": "Real-time event streaming",
             "GET /health": "Service health check",
+            "GET /live": "Liveness probe",
+            "GET /ready": "Readiness probe",
+            "GET /metrics": "Prometheus metrics exposition",
         },
     }
 
