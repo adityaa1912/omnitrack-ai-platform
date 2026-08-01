@@ -122,9 +122,18 @@ DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 1000
 
 # Initialize service from the sole runtime configuration source.
+# ``database_url`` selects PostgreSQL (env-provided) or SQLite (dev default);
+# pooling/retry knobs only apply to PostgreSQL. A database that never becomes
+# reachable raises here, failing startup gracefully before the app serves.
 service = InferenceService(
-    db_path=settings.sqlite_path,
+    db_path=settings.database_url,
     event_capacity=settings.event_buffer_capacity,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_recycle_seconds=settings.db_pool_recycle_seconds,
+    pool_pre_ping=settings.db_pool_pre_ping,
+    connect_max_attempts=settings.db_connect_max_attempts,
+    connect_retry_delay_seconds=settings.db_connect_retry_delay_seconds,
 )
 
 # ---------------------------------------------------------------------------
@@ -184,13 +193,13 @@ def _check_configuration() -> CheckResult:
     """Readiness: settings must be constructible and internally valid.
 
     ``get_settings`` is cached and validated by pydantic at import; reaching
-    this check means configuration loaded. We additionally confirm the resolved
-    sqlite path is set (the model validator guarantees it).
+    this check means configuration loaded. We additionally confirm a database
+    URL resolved (PostgreSQL when configured, else the SQLite path).
     """
     try:
-        if not settings.sqlite_path:
+        if not settings.database_url:
             return CheckResult(
-                name="configuration", ok=False, detail="sqlite_path unresolved"
+                name="configuration", ok=False, detail="database_url unresolved"
             )
         return CheckResult(name="configuration", ok=True, detail="valid")
     except Exception as exc:  # noqa: BLE001

@@ -1,10 +1,9 @@
 """Alembic migration environment for OmniTrack.
 
-The database URL is resolved from ``OMNITRACK_DB_PATH`` (default
-``inference_data.db``) — the same SQLite file the application uses — so
-``alembic upgrade head`` migrates the real database. ``target_metadata`` is the
-application's models' metadata, so ``--autogenerate`` diffs against
-``backend/models.py``.
+The database URL is resolved from the application settings: PostgreSQL when
+``OMNITRACK_POSTGRES_URL`` is set, otherwise the SQLite file (``OMNITRACK_DB_PATH``
+or the default ``inference_data.db``). ``target_metadata`` is the application's
+models' metadata, so ``--autogenerate`` diffs against ``backend/models.py``.
 
 Importing ``backend.models`` does not construct the service or create tables
 (see ``backend/__init__.py``), so Alembic owns the schema without fighting the
@@ -30,10 +29,20 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Resolve the SQLite URL from the environment (overrides the placeholder in
-# alembic.ini), matching the application's database file.
-_db_path = os.environ.get("OMNITRACK_DB_PATH", "inference_data.db")
-config.set_main_option("sqlalchemy.url", f"sqlite:///{_db_path}")
+# Resolve the database URL. Prefer the app's settings (which honour
+# OMNITRACK_POSTGRES_URL); fall back to OMNITRACK_DB_PATH / default SQLite so
+# migrations can run without the full settings environment.
+def _resolve_url() -> str:
+    try:
+        from backend.settings import get_settings
+
+        return get_settings().database_url
+    except Exception:  # noqa: BLE001 - settings may be unavailable in bare envs
+        db_path = os.environ.get("OMNITRACK_DB_PATH", "inference_data.db")
+        return f"sqlite:///{db_path}"
+
+
+config.set_main_option("sqlalchemy.url", _resolve_url())
 
 target_metadata = Base.metadata
 

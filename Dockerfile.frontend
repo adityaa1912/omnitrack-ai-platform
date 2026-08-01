@@ -30,6 +30,6 @@ COPY --from=build /app/frontend/dist /usr/share/nginx/html
 
 STOPSIGNAL SIGTERM
 
-HEALTHCHECK CMD-SHELL wget --quiet --spider "http://127.0.0.1:${OMNITRACK_FRONTEND_PORT:-8080}/healthz" || exit 1
+HEALTHCHECK CMD ["sh", "-c", "wget --quiet --spider \"http://127.0.0.1:${OMNITRACK_FRONTEND_PORT:-8080}/healthz\" || exit 1"]
 
 CMD ["nginx", "-g", "daemon off;"]

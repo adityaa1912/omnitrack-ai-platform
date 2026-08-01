@@ -38,6 +38,6 @@ USER omnitrack
 
 STOPSIGNAL SIGTERM
 
-HEALTHCHECK CMD-SHELL python -c "import os; from urllib.request import urlopen; urlopen('http://127.0.0.1:' + os.environ.get('OMNITRACK_API_PORT', '8000') + '/health', timeout=3).read()"
+HEALTHCHECK CMD ["python", "-c", "import os; from urllib.request import urlopen; urlopen('http://127.0.0.1:' + os.environ.get('OMNITRACK_API_PORT', '8000') + '/health', timeout=3).read()"]
 
 CMD ["python", "-m", "backend.run"]

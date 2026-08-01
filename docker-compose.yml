@@ -1,21 +1,46 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-omnitrack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-omnitrack}
+      POSTGRES_DB: ${POSTGRES_DB:-omnitrack}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - omnitrack
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+      interval: "${OMNITRACK_HEALTHCHECK_INTERVAL_SECONDS:-30}s"
+      timeout: "${OMNITRACK_HEALTHCHECK_TIMEOUT_SECONDS:-5}s"
+      start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS:-20}s"
+      retries: ${OMNITRACK_HEALTHCHECK_RETRIES:-3}
+
   backend:
     build:
       context: .
       dockerfile: Dockerfile.backend
     image: omnitrack-backend:local
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       OMNITRACK_ENVIRONMENT: container
+      OMNITRACK_POSTGRES_URL: ${OMNITRACK_POSTGRES_URL:-postgresql+psycopg://omnitrack:omnitrack@postgres:5432/omnitrack}
     ports:
-      - "${OMNITRACK_API_PORT}:${OMNITRACK_API_PORT}"
+      - "${OMNITRACK_API_PORT:-8000}:${OMNITRACK_API_PORT:-8000}"
     volumes:
       - backend-data:/app/data
     networks:
       - omnitrack
     restart: unless-stopped
-    stop_grace_period: "${OMNITRACK_CONTAINER_STOP_GRACE_PERIOD_SECONDS}s"
+    stop_grace_period: "${OMNITRACK_CONTAINER_STOP_GRACE_PERIOD_SECONDS:-15}s"
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD-SHELL
@@ -23,45 +48,48 @@ services:
           python -c "import os; from urllib.request import urlopen;
           urlopen('http://127.0.0.1:' + os.environ['OMNITRACK_API_PORT'] +
           '/health', timeout=3).read()"
-      interval: "${OMNITRACK_HEALTHCHECK_INTERVAL_SECONDS}s"
-      timeout: "${OMNITRACK_HEALTHCHECK_TIMEOUT_SECONDS}s"
-      start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS}s"
-      retries: ${OMNITRACK_HEALTHCHECK_RETRIES}
+      interval: "${OMNITRACK_HEALTHCHECK_INTERVAL_SECONDS:-30}s"
+      timeout: "${OMNITRACK_HEALTHCHECK_TIMEOUT_SECONDS:-5}s"
+      start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS:-20}s"
+      retries: ${OMNITRACK_HEALTHCHECK_RETRIES:-3}
 
   frontend:
     build:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
-        VITE_WS_BASE_URL: ${VITE_WS_BASE_URL}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_WS_BASE_URL: ${VITE_WS_BASE_URL:-/ws}
         VITE_API_KEY: ${VITE_API_KEY:-}
     image: omnitrack-frontend:local
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       OMNITRACK_ENVIRONMENT: container
     ports:
-      - "${OMNITRACK_FRONTEND_PORT}:${OMNITRACK_FRONTEND_PORT}"
+      - "${OMNITRACK_FRONTEND_PORT:-8080}:${OMNITRACK_FRONTEND_PORT:-8080}"
     networks:
       - omnitrack
     restart: unless-stopped
-    stop_grace_period: "${OMNITRACK_CONTAINER_STOP_GRACE_PERIOD_SECONDS}s"
+    stop_grace_period: "${OMNITRACK_CONTAINER_STOP_GRACE_PERIOD_SECONDS:-15}s"
     depends_on:
       backend:
         condition: service_healthy
     healthcheck:
       test:
         - CMD-SHELL
-        - "wget --quiet --spider http://127.0.0.1:${OMNITRACK_FRONTEND_PORT}/healthz || exit 1"
-      interval: "${OMNITRACK_HEALTHCHECK_INTERVAL_SECONDS}s"
-      timeout: "${OMNITRACK_HEALTHCHECK_TIMEOUT_SECONDS}s"
-      start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS}s"
-      retries: ${OMNITRACK_HEALTHCHECK_RETRIES}
+        - "wget --quiet --spider http://127.0.0.1:${OMNITRACK_FRONTEND_PORT:-8080}/healthz || exit 1"
+      interval: "${OMNITRACK_HEALTHCHECK_INTERVAL_SECONDS:-30}s"
+      timeout: "${OMNITRACK_HEALTHCHECK_TIMEOUT_SECONDS:-5}s"
+      start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS:-20}s"
+      retries: ${OMNITRACK_HEALTHCHECK_RETRIES:-3}
 
 volumes:
   backend-data:
     name: omnitrack-backend-data
+  postgres-data:
+    name: omnitrack-postgres-data
 
 networks:
   omnitrack:

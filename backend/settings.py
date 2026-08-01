@@ -43,6 +43,18 @@ class Settings(BaseSettings):
     redis_url: RedisDsn | None = None
     kafka_bootstrap_servers: str | None = None
 
+    # PostgreSQL connection pooling. Ignored for SQLite (which uses SQLAlchemy's
+    # default QueuePool over a single file). ``db_pool_pre_ping`` validates a
+    # pooled connection before checkout so a dropped/stale connection is
+    # recycled instead of surfacing as a mid-request error.
+    db_pool_size: int = Field(default=5, ge=1)
+    db_max_overflow: int = Field(default=10, ge=0)
+    db_pool_recycle_seconds: int = Field(default=1800, ge=-1)
+    db_pool_pre_ping: bool = True
+    # Transient-connect retry at startup (PostgreSQL may still be coming up).
+    db_connect_max_attempts: int = Field(default=5, ge=1)
+    db_connect_retry_delay_seconds: float = Field(default=1.0, gt=0)
+
     model_path: str = Field(default="yolov8n.pt", min_length=1)
     inference_device: str = Field(default="cpu", min_length=1)
     inference_source_retry_attempts: int = Field(default=3, ge=1)
@@ -135,6 +147,23 @@ class Settings(BaseSettings):
                 "or equal to OMNITRACK_INFERENCE_BACKOFF_INITIAL_SECONDS"
             )
         return self
+
+    @property
+    def database_url(self) -> str:
+        """Resolve the SQLAlchemy database URL for the active environment.
+
+        PostgreSQL is used when ``OMNITRACK_POSTGRES_URL`` is set (production /
+        container); otherwise the local SQLite file is used (development). This
+        is the single selection point — the rest of the app only sees a URL.
+        """
+        if self.postgres_url is not None:
+            return str(self.postgres_url)
+        return f"sqlite:///{self.sqlite_path}"
+
+    @property
+    def database_is_sqlite(self) -> bool:
+        """Whether the resolved database URL targets SQLite."""
+        return self.database_url.startswith("sqlite")
 
 
 @lru_cache(maxsize=1)

@@ -504,10 +504,30 @@ class InferenceStream:
 class InferenceService:
     """Service managing multiple inference streams."""
 
-    def __init__(self, db_path: str = "inference_data.db", event_capacity: int = 1000) -> None:
+    def __init__(
+        self,
+        db_path: str = "inference_data.db",
+        event_capacity: int = 1000,
+        *,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_recycle_seconds: int = 1800,
+        pool_pre_ping: bool = True,
+        connect_max_attempts: int = 1,
+        connect_retry_delay_seconds: float = 1.0,
+    ) -> None:
         # Thread-safe DB access: one engine + a scoped_session registry shared by
         # every stream thread, each of which uses its own thread-local session.
-        self.engine, self.Session = create_session_factory(db_path)
+        # ``db_path`` may be a SQLite file path or a full SQLAlchemy URL.
+        self.engine, self.Session = self._build_engine_with_retry(
+            db_path,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_recycle_seconds=pool_recycle_seconds,
+            pool_pre_ping=pool_pre_ping,
+            connect_max_attempts=connect_max_attempts,
+            connect_retry_delay_seconds=connect_retry_delay_seconds,
+        )
         self.streams: Dict[str, InferenceStream] = {}
         # Stop joins run in a worker so the ASGI loop can close WebSockets.
         # Guard the registry against a concurrent ``reap_finished`` removing a
@@ -517,6 +537,50 @@ class InferenceService:
         # Bounded in-memory event history per stream (persists across stop).
         self.event_store = EventStore(capacity=event_capacity)
         self._is_shutdown = False
+
+    @staticmethod
+    def _build_engine_with_retry(
+        db_path: str,
+        *,
+        pool_size: int,
+        max_overflow: int,
+        pool_recycle_seconds: int,
+        pool_pre_ping: bool,
+        connect_max_attempts: int,
+        connect_retry_delay_seconds: float,
+    ):
+        """Create the engine/session factory, retrying transient connect failures.
+
+        ``create_session_factory`` runs ``create_all`` against a live connection,
+        so a database that is still starting (e.g. a PostgreSQL container not yet
+        accepting connections) raises here. We retry a bounded number of times
+        with a fixed delay, then re-raise so startup fails gracefully and the
+        process surfaces a clear error instead of running against a dead DB.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, connect_max_attempts + 1):
+            try:
+                return create_session_factory(
+                    db_path,
+                    pool_size=pool_size,
+                    max_overflow=max_overflow,
+                    pool_recycle_seconds=pool_recycle_seconds,
+                    pool_pre_ping=pool_pre_ping,
+                )
+            except Exception as exc:  # noqa: BLE001 - retried then re-raised
+                last_exc = exc
+                if attempt < connect_max_attempts:
+                    logger.warning(
+                        f"Database connect attempt {attempt}/"
+                        f"{connect_max_attempts} failed: {exc}; retrying in "
+                        f"{connect_retry_delay_seconds}s"
+                    )
+                    time.sleep(connect_retry_delay_seconds)
+        logger.error(
+            f"Database unavailable after {connect_max_attempts} attempt(s): "
+            f"{last_exc}"
+        )
+        raise last_exc  # type: ignore[misc]
 
     def start_stream(self, config: StreamConfig) -> StreamMetrics:
         """Start a new inference stream."""
