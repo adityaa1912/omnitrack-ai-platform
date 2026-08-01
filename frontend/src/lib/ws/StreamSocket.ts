@@ -45,6 +45,12 @@ function isWsMessage(value: unknown): value is WsMessage {
   return type === "frame" || type === "keep_alive";
 }
 
+function isStoppedStreamClose(event: CloseEvent): boolean {
+  // A server-initiated, normal closure means the stream was deleted.  It is
+  // terminal for this stream id, unlike an unexpected network close.
+  return event.code === 1000 && event.reason === "stream stopped";
+}
+
 export class StreamSocket {
   private readonly streamId: string;
   private readonly baseDelayMs: number;
@@ -64,7 +70,7 @@ export class StreamSocket {
     this.streamId = streamId;
     this.baseDelayMs = options.baseDelayMs ?? 1_000;
     this.maxDelayMs = options.maxDelayMs ?? 15_000;
-    this.staleTimeoutMs = options.staleTimeoutMs ?? 8_000;
+    this.staleTimeoutMs = options.staleTimeoutMs ?? 15_000;
     this.onFrame = options.onFrame;
     this.onStatus = options.onStatus;
   }
@@ -87,6 +93,7 @@ export class StreamSocket {
   }
 
   private openSocket(): void {
+    if (this.intentionalClose) return;
     this.teardownSocket();
     this.setStatus(this.attempt === 0 ? "connecting" : "reconnecting");
 
@@ -107,9 +114,14 @@ export class StreamSocket {
     ws.onerror = () => {
       /* defer to onclose */
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      if (this.ws === ws) this.ws = null;
       this.clearStaleTimer();
-      if (this.intentionalClose) return;
+      if (this.intentionalClose || isStoppedStreamClose(event)) {
+        this.clearReconnectTimer();
+        this.setStatus("closed");
+        return;
+      }
       this.scheduleReconnect();
     };
   }
@@ -137,7 +149,10 @@ export class StreamSocket {
     this.setStatus("reconnecting");
     const delay = this.computeBackoff(this.attempt);
     this.attempt += 1;
-    this.reconnectTimer = setTimeout(() => this.openSocket(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, delay);
   }
 
   private computeBackoff(attempt: number): number {

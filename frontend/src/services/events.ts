@@ -81,8 +81,12 @@ export interface EventSocketLike {
   onopen: (() => void) | null;
   onmessage: ((event: { data: unknown }) => void) | null;
   onerror: (() => void) | null;
-  onclose: (() => void) | null;
+  onclose: ((event: CloseEvent) => void) | null;
   close(): void;
+}
+
+function isStoppedStreamClose(event: CloseEvent): boolean {
+  return event.code === 1000 && event.reason === "stream stopped";
 }
 
 export interface EventStreamClientOptions {
@@ -239,9 +243,13 @@ export class EventStreamClient {
     socket.onerror = () => {
       /* defer to onclose */
     };
-    socket.onclose = () => {
-      this.socket = null;
-      if (this.intentionalClose) return;
+    socket.onclose = (event) => {
+      if (this.socket === socket) this.socket = null;
+      if (this.intentionalClose || isStoppedStreamClose(event)) {
+        this.clearReconnectTimer();
+        this.setStatus("closed");
+        return;
+      }
       this.scheduleReconnect();
     };
   }

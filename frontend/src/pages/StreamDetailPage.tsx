@@ -83,7 +83,7 @@ export function StreamDetailPage() {
 
         <EventFeed
           streamId={id}
-          enabled={Boolean(id)}
+          enabled={isRunning}
           className="h-[70vh] lg:col-span-1"
         />
       </div>

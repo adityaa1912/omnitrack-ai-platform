@@ -19,6 +19,7 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field
 import numpy as np
 
@@ -114,6 +115,49 @@ MAX_EVENT_LIMIT = 1000
 service = InferenceService(db_path="inference_data.db")
 
 
+class StreamWebSocketManager:
+    """Coordinate live WebSocket handlers with a stream's lifecycle.
+
+    The manager deliberately does not call ``WebSocket.close()`` itself.  A
+    handler is the sole owner of its ASGI WebSocket and closes it after its
+    stop event is set.  This prevents concurrent ASGI close frames, which is
+    what left the underlying ``websockets`` protocol in an invalid state.
+    """
+
+    def __init__(self) -> None:
+        self._stop_events: dict[str, set[asyncio.Event]] = {}
+
+    def register(self, stream_id: str) -> asyncio.Event:
+        stop_event = asyncio.Event()
+        self._stop_events.setdefault(stream_id, set()).add(stop_event)
+        return stop_event
+
+    def unregister(self, stream_id: str, stop_event: asyncio.Event) -> None:
+        connections = self._stop_events.get(stream_id)
+        if connections is None:
+            return
+        connections.discard(stop_event)
+        if not connections:
+            self._stop_events.pop(stream_id, None)
+
+    def close_stream(self, stream_id: str) -> None:
+        for stop_event in tuple(self._stop_events.get(stream_id, ())):
+            stop_event.set()
+
+    def close_all(self) -> None:
+        for stream_id in tuple(self._stop_events):
+            self.close_stream(stream_id)
+
+
+stream_websockets = StreamWebSocketManager()
+
+
+async def _close_stopped_stream_socket(websocket: WebSocket) -> None:
+    """Send the one, normal close frame owned by a stopped-stream handler."""
+    if websocket.application_state is WebSocketState.CONNECTED:
+        await websocket.close(code=1000, reason="stream stopped")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """
@@ -128,6 +172,7 @@ async def lifespan(_app: FastAPI):
     """
     yield
     logger.info("Application shutdown: stopping streams and disposing resources")
+    stream_websockets.close_all()
     await asyncio.to_thread(service.shutdown)
 
 
@@ -143,12 +188,12 @@ app = FastAPI(
 # OMNITRACK_CORS_ORIGINS (comma-separated); defaults to '*' for local dev.
 _cors_origins, _cors_allow_credentials = _cors_config()
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=_cors_allow_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.middleware("http")
@@ -368,7 +413,12 @@ async def start_stream(request: StartStreamRequest):
 async def stop_stream(stream_id: str):
     """Stop an inference stream."""
     try:
-        service.stop_stream(stream_id)
+        # Wake every handler first.  Each handler owns and sends its own close
+        # frame, so this cannot race a send/receive task with a second close.
+        stream_websockets.close_stream(stream_id)
+        # ``stop`` may join the inference thread; never block the ASGI loop
+        # while WebSocket handlers are processing their lifecycle signal.
+        await asyncio.to_thread(service.stop_stream, stream_id)
         return {"status": "stopped", "stream_id": stream_id}
 
     except ValueError as e:
@@ -527,57 +577,99 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
         return
 
     await websocket.accept()
-
     logger.info(f"WebSocket client connected to stream {stream_id}")
+    stop_event = stream_websockets.register(stream_id)
 
-    try:
+    async def _watch_disconnect() -> None:
+        """Wait for a client close while frame delivery is otherwise idle."""
         while True:
-            try:
-                # Get next frame from stream
-                frame_data = service.get_stream_frame(stream_id, timeout=1.0)
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
 
-                if frame_data is None:
-                    # No frame available, send keep-alive
-                    await websocket.send_json({"type": "keep_alive"})
-                    continue
+    frame_task: Optional[asyncio.Task] = None
+    disconnect_task: Optional[asyncio.Task] = None
+    stop_task: Optional[asyncio.Task] = None
+    try:
+        # Register before the existence check.  There is no await between them,
+        # so a concurrent stop cannot delete the stream without waking us.
+        if not service.has_stream(stream_id):
+            await _close_stopped_stream_socket(websocket)
+            return
 
-                # Encode frame as JPEG
-                frame = frame_data["frame"]
-                _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                frame_base64 = base64.b64encode(buffer).decode("utf-8")
+        disconnect_task = asyncio.create_task(_watch_disconnect())
+        stop_task = asyncio.create_task(stop_event.wait())
+        while True:
+            # Queue.get is synchronous.  Running this bounded wait in a worker
+            # keeps the ASGI loop responsive to a disconnect or stream stop.
+            frame_task = asyncio.create_task(
+                asyncio.to_thread(service.get_stream_frame, stream_id, 1.0)
+            )
+            done, _ = await asyncio.wait(
+                {frame_task, disconnect_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-                # Send frame with detections (coerce NumPy scalars -> native)
-                await websocket.send_json({
-                    "type": "frame",
-                    "stream_id": stream_id,
-                    "timestamp": _to_native(frame_data["timestamp"]),
-                    "frame": frame_base64,
-                    "detections": [
-                        {
-                            "x1": _to_native(d.x1),
-                            "y1": _to_native(d.y1),
-                            "x2": _to_native(d.x2),
-                            "y2": _to_native(d.y2),
-                            "class_id": _to_native(d.class_id),
-                            "class_name": d.class_name,
-                            "confidence": f"{float(d.confidence):.2f}",
-                            "track_id": (
-                                None
-                                if getattr(d, "track_id", None) is None
-                                else int(getattr(d, "track_id"))
-                            ),
-                        }
-                        for d in frame_data["detections"]
-                    ],
-                })
-
-            except WebSocketDisconnect:
+            if stop_task in done:
+                await _close_stopped_stream_socket(websocket)
+                return
+            if disconnect_task in done:
                 logger.info(f"WebSocket client disconnected from stream {stream_id}")
-                break
+                return
 
-    except Exception as e:
-        logger.error(f"WebSocket error for stream {stream_id}: {e}")
-        await websocket.close(code=1011, reason=str(e))
+            try:
+                frame_data = frame_task.result()
+            except ValueError:
+                # A naturally-finished/reaped stream is terminal, not a
+                # WebSocket server error and must not provoke reconnects.
+                await _close_stopped_stream_socket(websocket)
+                return
+            finally:
+                frame_task = None
+
+            if frame_data is None:
+                await websocket.send_json({"type": "keep_alive"})
+                continue
+
+            frame = frame_data["frame"]
+            _, buffer = cv2.imencode(
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+            )
+            frame_base64 = base64.b64encode(buffer).decode("utf-8")
+            await websocket.send_json({
+                "type": "frame",
+                "stream_id": stream_id,
+                "timestamp": _to_native(frame_data["timestamp"]),
+                "frame": frame_base64,
+                "detections": [
+                    {
+                        "x1": _to_native(d.x1),
+                        "y1": _to_native(d.y1),
+                        "x2": _to_native(d.x2),
+                        "y2": _to_native(d.y2),
+                        "class_id": _to_native(d.class_id),
+                        "class_name": d.class_name,
+                        "confidence": f"{float(d.confidence):.2f}",
+                        "track_id": (
+                            None
+                            if getattr(d, "track_id", None) is None
+                            else int(getattr(d, "track_id"))
+                        ),
+                    }
+                    for d in frame_data["detections"]
+                ],
+            })
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected from stream {stream_id}")
+    finally:
+        for task in (frame_task, disconnect_task, stop_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (frame_task, disconnect_task, stop_task) if task is not None),
+            return_exceptions=True,
+        )
+        stream_websockets.unregister(stream_id, stop_event)
 
 
 # ============================================================================
@@ -619,8 +711,24 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
 
     await websocket.accept()
     logger.info(f"Event WebSocket client connected to stream {stream_id}")
+    stop_event = stream_websockets.register(stream_id)
 
-    buffer = service.event_store.get_or_create(stream_id)
+    # Do not create an EventBuffer for an unknown/deleted stream.  Register
+    # first so a stop racing this accepted connection cannot be missed.
+    if not service.has_stream(stream_id):
+        try:
+            await _close_stopped_stream_socket(websocket)
+        finally:
+            stream_websockets.unregister(stream_id, stop_event)
+        return
+
+    buffer = service.event_store.get(stream_id)
+    if buffer is None:  # defensive: start_stream always creates this buffer
+        try:
+            await _close_stopped_stream_socket(websocket)
+        finally:
+            stream_websockets.unregister(stream_id, stop_event)
+        return
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_WS_QUEUE_MAXSIZE)
 
@@ -688,25 +796,30 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
 
     send_task = asyncio.create_task(_send_loop())
     watch_task = asyncio.create_task(_watch_disconnect())
+    stop_task = asyncio.create_task(stop_event.wait())
     try:
         # Whichever finishes first ends the session: a send failure (client
-        # gone) or an observed disconnect.
-        await asyncio.wait(
-            {send_task, watch_task}, return_when=asyncio.FIRST_COMPLETED
+        # gone), an observed disconnect, or a stream lifecycle stop.
+        done, _ = await asyncio.wait(
+            {send_task, watch_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
+        if stop_task in done:
+            await _close_stopped_stream_socket(websocket)
+        elif watch_task in done:
+            logger.info(f"Event WebSocket client disconnected from stream {stream_id}")
+        else:
+            # Surface only the send task's expected WebSocketDisconnect to the
+            # outer handler; unexpected faults are not masked as disconnects.
+            await send_task
+    except WebSocketDisconnect:
+        logger.info(f"Event WebSocket client disconnected from stream {stream_id}")
     finally:
         buffer.unsubscribe(token)  # stop producing into a dead connection
-        for task in (send_task, watch_task):
+        for task in (send_task, watch_task, stop_task):
             task.cancel()
-        # Consume any pending result/exception so it isn't logged as
-        # "Task exception was never retrieved".
-        for task in (send_task, watch_task):
-            try:
-                await task
-            except (WebSocketDisconnect, asyncio.CancelledError):
-                pass
-            except Exception:  # noqa: BLE001 - disconnect races are expected
-                pass
+        # Retrieve every outcome so cancelled/send tasks never leak warnings.
+        await asyncio.gather(send_task, watch_task, stop_task, return_exceptions=True)
+        stream_websockets.unregister(stream_id, stop_event)
         logger.info(f"Event WebSocket client disconnected from stream {stream_id}")
 
 

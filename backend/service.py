@@ -444,6 +444,11 @@ class InferenceService:
         # every stream thread, each of which uses its own thread-local session.
         self.engine, self.Session = create_session_factory(db_path)
         self.streams: Dict[str, InferenceStream] = {}
+        # Stop joins run in a worker so the ASGI loop can close WebSockets.
+        # Guard the registry against a concurrent ``reap_finished`` removing a
+        # stream in the narrow interval after ``stop`` flips is_running.
+        self._streams_lock = threading.RLock()
+        self._stopping: set[str] = set()
         # Bounded in-memory event history per stream (persists across stop).
         self.event_store = EventStore(capacity=event_capacity)
         self._is_shutdown = False
@@ -453,8 +458,9 @@ class InferenceService:
         # Drop any finished streams first, so a completed run does not block
         # reusing its stream_id.
         self.reap_finished()
-        if config.stream_id in self.streams:
-            raise ValueError(f"Stream {config.stream_id} already exists")
+        with self._streams_lock:
+            if config.stream_id in self.streams:
+                raise ValueError(f"Stream {config.stream_id} already exists")
 
         stream = InferenceStream(
             config,
@@ -462,17 +468,33 @@ class InferenceService:
             event_buffer=self.event_store.get_or_create(config.stream_id),
         )
         stream.start()
-        self.streams[config.stream_id] = stream
+        with self._streams_lock:
+            self.streams[config.stream_id] = stream
 
         return stream.get_metrics()
 
     def stop_stream(self, stream_id: str) -> None:
         """Stop an inference stream."""
-        if stream_id not in self.streams:
-            raise ValueError(f"Stream {stream_id} not found")
+        with self._streams_lock:
+            stream = self.streams.get(stream_id)
+            if stream is None:
+                raise ValueError(f"Stream {stream_id} not found")
+            self._stopping.add(stream_id)
 
-        self.streams[stream_id].stop()
-        del self.streams[stream_id]
+        try:
+            stream.stop()
+        finally:
+            with self._streams_lock:
+                # Do not remove a newer stream that reused the id after this
+                # stream was stopped.
+                if self.streams.get(stream_id) is stream:
+                    self.streams.pop(stream_id, None)
+                self._stopping.discard(stream_id)
+
+    def has_stream(self, stream_id: str) -> bool:
+        """Return whether ``stream_id`` is still registered as live."""
+        with self._streams_lock:
+            return stream_id in self.streams
 
     def shutdown(self) -> None:
         """
@@ -535,9 +557,14 @@ class InferenceService:
         mutator of ``self.streams`` — so no lock is needed. The joined threads
         are already ending, so the bounded join returns effectively immediately.
         """
-        finished = [sid for sid, st in self.streams.items() if not st.is_running]
-        for stream_id in finished:
-            stream = self.streams.pop(stream_id, None)
+        with self._streams_lock:
+            finished = [
+                sid
+                for sid, st in self.streams.items()
+                if sid not in self._stopping and not st.is_running
+            ]
+            finished_streams = [self.streams.pop(stream_id) for stream_id in finished]
+        for stream in finished_streams:
             if stream is not None and stream.thread is not None:
                 stream.thread.join(timeout=1.0)
         if finished:
