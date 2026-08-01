@@ -8,7 +8,6 @@ Provides WebSocket for real-time frame streaming.
 import asyncio
 import hmac
 import logging
-import os
 import base64
 import cv2
 import numpy as np
@@ -21,14 +20,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
 from pydantic import BaseModel, Field
-import numpy as np
 
 from .service import InferenceService, StreamConfig, StreamMetrics
+from .settings import get_settings
 from inference.types import Detection as InferenceDetection
 from inference.events.regions import Zone, CrossingLine
 
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 
 def _to_native(value):
@@ -41,7 +41,7 @@ def _to_native(value):
 
 
 def _cors_config() -> tuple[list[str], bool]:
-    """Resolve CORS allowed origins from the environment.
+    """Resolve CORS allowed origins from validated platform settings.
 
     ``OMNITRACK_CORS_ORIGINS`` is a comma-separated list of allowed origins;
     unset or empty defaults to ``*`` (permissive, suitable for local dev, e.g.
@@ -52,7 +52,7 @@ def _cors_config() -> tuple[list[str], bool]:
     credentials are enabled only when explicit origins are configured. If ``*``
     appears anywhere in the list it wins (wildcard, credentials off).
     """
-    raw = os.environ.get("OMNITRACK_CORS_ORIGINS", "*")
+    raw = settings.cors_origins
     origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
     if not origins or "*" in origins:
         return ["*"], False
@@ -66,7 +66,7 @@ def _cors_config() -> tuple[list[str], bool]:
 # NOTE: a browser SPA that embeds the key exposes it to end users, so this is a
 # shared-secret gate for locked-down deployments and non-browser clients — not a
 # substitute for real user authentication.
-API_KEY = os.environ.get("OMNITRACK_API_KEY", "").strip() or None
+API_KEY = (settings.api_key or "").strip() or None
 
 # Paths that never require a key (health checks, docs, service root).
 _AUTH_EXEMPT_PATHS = frozenset({"/health", "/", "/docs", "/redoc", "/openapi.json"})
@@ -111,8 +111,11 @@ def _build_geometry(zone_specs, line_specs):
 DEFAULT_EVENT_LIMIT = 100
 MAX_EVENT_LIMIT = 1000
 
-# Initialize service
-service = InferenceService(db_path="inference_data.db")
+# Initialize service from the sole runtime configuration source.
+service = InferenceService(
+    db_path=settings.sqlite_path,
+    event_capacity=settings.event_buffer_capacity,
+)
 
 
 class StreamWebSocketManager:
@@ -188,12 +191,12 @@ app = FastAPI(
 # OMNITRACK_CORS_ORIGINS (comma-separated); defaults to '*' for local dev.
 _cors_origins, _cors_allow_credentials = _cors_config()
 app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["http://localhost:5173"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -388,6 +391,16 @@ async def start_stream(request: StartStreamRequest):
             tracking_enabled=request.tracking_enabled,
             track_distance=request.track_distance,
             max_age=request.max_age,
+            model_path=settings.model_path,
+            inference_device=settings.inference_device,
+            source_retry_attempts=settings.inference_source_retry_attempts,
+            source_retry_delay_seconds=settings.inference_source_retry_delay_seconds,
+            source_stream_timeout_seconds=settings.inference_stream_timeout_seconds,
+            source_backoff_initial_seconds=settings.inference_backoff_initial_seconds,
+            source_backoff_max_seconds=settings.inference_backoff_max_seconds,
+            source_backoff_factor=settings.inference_backoff_factor,
+            stop_timeout_seconds=settings.stream_stop_timeout_seconds,
+            frame_queue_capacity=settings.frame_queue_capacity,
             zones=zones,
             lines=lines,
             dwell_seconds=request.dwell_seconds,
@@ -603,7 +616,11 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
             # Queue.get is synchronous.  Running this bounded wait in a worker
             # keeps the ASGI loop responsive to a disconnect or stream stop.
             frame_task = asyncio.create_task(
-                asyncio.to_thread(service.get_stream_frame, stream_id, 1.0)
+                asyncio.to_thread(
+                    service.get_stream_frame,
+                    stream_id,
+                    settings.frame_ws_poll_timeout_seconds,
+                )
             )
             done, _ = await asyncio.wait(
                 {frame_task, disconnect_task, stop_task},
@@ -680,7 +697,7 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
 # store's retention: it caps how many events may queue for a single slow client
 # before the oldest is dropped, so one stalled consumer can neither grow server
 # memory without bound nor back-pressure the inference thread.
-EVENT_WS_QUEUE_MAXSIZE = 100
+EVENT_WS_QUEUE_MAXSIZE = settings.event_ws_queue_capacity
 
 
 @app.websocket("/stream/{stream_id}/events/ws")

@@ -1,0 +1,41 @@
+server {
+    listen ${OMNITRACK_FRONTEND_PORT};
+    listen [::]:${OMNITRACK_FRONTEND_PORT};
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Preserve the frontend's existing /api contract while routing it over the
+    # private Compose network. The trailing slash strips the public prefix.
+    location /api/ {
+        proxy_pass http://${OMNITRACK_BACKEND_HOST}:${OMNITRACK_API_PORT}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Frame and event sockets use the existing /ws public prefix.
+    location /ws/ {
+        proxy_pass http://${OMNITRACK_BACKEND_HOST}:${OMNITRACK_API_PORT}/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+}

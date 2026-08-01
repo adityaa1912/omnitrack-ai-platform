@@ -1,0 +1,36 @@
+# Source-control and local development state
+.git
+.gitignore
+.agents
+.codex
+venv
+.venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+
+# Frontend dependencies and generated assets
+frontend/node_modules
+frontend/dist
+
+# Runtime state and developer-local configuration
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.env.*
+
+# Non-runtime repository material. Camera/video inputs are mounted at runtime.
+datasets
+test_recovery.db
+PROJECT_DOCS
+BACKEND_QUICKREF.md
+README.md
+alembic.ini
+alembic
+kafka
+kubernetes
+monitoring
+scripts
+tests

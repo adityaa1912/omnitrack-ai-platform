@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# Build-time API and WebSocket origins preserve the existing Vite contract:
+# /api and /ws when an API gateway shares the browser origin.
+FROM node:20-bookworm-slim AS build
+
+WORKDIR /app/frontend
+
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+COPY frontend ./
+
+ARG VITE_API_BASE_URL=/api
+ARG VITE_WS_BASE_URL=/ws
+ARG VITE_API_KEY=
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL} \
+    VITE_WS_BASE_URL=${VITE_WS_BASE_URL} \
+    VITE_API_KEY=${VITE_API_KEY}
+
+RUN npm run build
+
+FROM nginx:1.27-alpine
+
+ENV OMNITRACK_FRONTEND_PORT=8080 \
+    OMNITRACK_BACKEND_HOST=backend \
+    OMNITRACK_API_PORT=8000
+
+COPY docker/nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=build /app/frontend/dist /usr/share/nginx/html
+
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK CMD-SHELL wget --quiet --spider "http://127.0.0.1:${OMNITRACK_FRONTEND_PORT:-8080}/healthz" || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

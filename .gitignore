@@ -10,6 +10,9 @@ __pycache__/
 # Logs
 *.log
 
+# Deployment configuration
+.env
+
 # OS
 .DS_Store
 Thumbs.db

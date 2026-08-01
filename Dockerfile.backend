@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+#
+# CPU baseline image. It intentionally runs one Uvicorn worker because stream
+# ownership, EventBuffer subscriptions, and WebSocket lifecycle state are
+# process-local in the current architecture.
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    OMNITRACK_ENVIRONMENT=container \
+    OMNITRACK_API_HOST=0.0.0.0 \
+    OMNITRACK_API_PORT=8000 \
+    OMNITRACK_API_WORKERS=1
+
+WORKDIR /app
+
+# OpenCV's video backends require these shared libraries in a slim image.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN python -m pip install -r requirements.txt
+
+COPY . ./
+
+# The existing detector resolves its default model relative to the working
+# directory. Fail the image build if that production dependency is absent,
+# rather than allowing an implicit network download at first stream start.
+RUN test -f /app/yolov8n.pt \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin omnitrack \
+    && mkdir /app/data \
+    && chown -R omnitrack:omnitrack /app
+
+USER omnitrack
+
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK CMD-SHELL python -c "import os; from urllib.request import urlopen; urlopen('http://127.0.0.1:' + os.environ.get('OMNITRACK_API_PORT', '8000') + '/health', timeout=3).read()"
+
+CMD ["python", "-m", "backend.run"]

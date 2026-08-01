@@ -61,6 +61,16 @@ class StreamConfig:
     tracking_enabled: bool = True
     track_distance: float = 50.0
     max_age: int = 30
+    model_path: str = "yolov8n.pt"
+    inference_device: str = "cpu"
+    source_retry_attempts: int = 3
+    source_retry_delay_seconds: float = 5.0
+    source_stream_timeout_seconds: float = 10.0
+    source_backoff_initial_seconds: float = 1.0
+    source_backoff_max_seconds: float = 30.0
+    source_backoff_factor: float = 2.0
+    stop_timeout_seconds: float = 5.0
+    frame_queue_capacity: int = 30
 
     # Scene geometry consumed by the event engine's zone/line detectors. Empty
     # by default => those detectors stay inert (behaviorally unchanged). Built
@@ -114,7 +124,7 @@ class InferenceStream:
         self.latest_frame: Optional[Frame] = None
 
         # Output queue for frames/detections
-        self.output_queue: Queue = Queue(maxsize=30)
+        self.output_queue: Queue = Queue(maxsize=config.frame_queue_capacity)
 
     def start(self) -> None:
         """Start the inference stream in a background thread."""
@@ -172,14 +182,16 @@ class InferenceStream:
 
         self.is_running = False
         if self.thread is not None:
-            self.thread.join(timeout=5.0)
+            self.thread.join(timeout=self.config.stop_timeout_seconds)
         self._cleanup()
         logger.info(f"Stream {self.config.stream_id} stopped")
 
     def _initialize_components(self) -> None:
         """Initialize detector, tracker, visualizer, frame source."""
         detector_config = DetectorConfig(
+            model_name=self.config.model_path,
             confidence_threshold=self.config.confidence_threshold,
+            device=self.config.inference_device,
         )
         self.detector = Detector(detector_config)
 
@@ -188,6 +200,12 @@ class InferenceStream:
             width=self.config.width,
             height=self.config.height,
             fps=self.config.fps,
+            retry_attempts=self.config.source_retry_attempts,
+            retry_delay_sec=self.config.source_retry_delay_seconds,
+            stream_timeout_sec=self.config.source_stream_timeout_seconds,
+            backoff_initial_sec=self.config.source_backoff_initial_seconds,
+            backoff_max_sec=self.config.source_backoff_max_seconds,
+            backoff_factor=self.config.source_backoff_factor,
         )
         self.frame_source = get_frame_source(frame_source_config)
         self.frame_source.open()
