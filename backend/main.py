@@ -139,6 +139,9 @@ service = InferenceService(
     scheduler_enabled=settings.scheduler_enabled,
     scheduler_workers=settings.scheduler_workers,
     scheduler_stream_queue_capacity=settings.scheduler_stream_queue_capacity,
+    batching_enabled=settings.batching_enabled,
+    batch_max_size=settings.batch_max_size,
+    batch_max_wait_ms=settings.batch_max_wait_ms,
 )
 
 # Record the active inference provider as an info-style gauge and log it at
@@ -303,6 +306,26 @@ def _check_scheduler() -> CheckResult:
     )
 
 
+def _check_batching() -> CheckResult:
+    """Readiness: report dynamic-batching status.
+
+    When batching is disabled (the default) the check passes and reports
+    ``disabled``. When enabled it reports the number of active detector
+    signatures currently sharing a batched model; a manager that has not been
+    built yet (no stream started) reports ``lazy`` and is still ready.
+    """
+    if not settings.batching_enabled:
+        return CheckResult(name="batching", ok=True, detail="disabled")
+    manager = getattr(service, "_batch_manager", None)
+    if manager is None:
+        return CheckResult(name="batching", ok=True, detail="not built (lazy)")
+    return CheckResult(
+        name="batching",
+        ok=True,
+        detail=f"signatures={manager.active_signatures()}",
+    )
+
+
 def _check_stream_manager() -> CheckResult:
     """Readiness: the stream manager must be constructed and not shut down."""
     if service is None:
@@ -382,6 +405,7 @@ readiness_probe.register(_check_model_available)
 readiness_probe.register(_check_onnx_provider)
 readiness_probe.register(_check_benchmark)
 readiness_probe.register(_check_scheduler)
+readiness_probe.register(_check_batching)
 readiness_probe.register(_check_stream_manager)
 readiness_probe.register(_check_database)
 readiness_probe.register(_check_redis)

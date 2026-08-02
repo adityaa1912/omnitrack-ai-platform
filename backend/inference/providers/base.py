@@ -53,6 +53,17 @@ class InferenceProvider(ABC):
     def predict(self, data: np.ndarray) -> List[RawDetection]:
         """Run inference on one BGR uint8 image; return raw detections."""
 
+    def predict_batch(self, batch: List[np.ndarray]) -> List[List[RawDetection]]:
+        """Run inference on several BGR uint8 images; return per-image detections.
+
+        Default implementation runs the images sequentially through
+        :meth:`predict`, so a backend without a native batched forward pass
+        (ONNX/OpenVINO/TensorRT here export static batch-1 graphs) stays correct
+        with no duplicated pre/post-processing. Backends that can fuse a batch
+        (e.g. torch) override this.
+        """
+        return [self.predict(data) for data in batch]
+
     @abstractmethod
     def class_names(self) -> dict[int, str]:
         """Return the class-id → name mapping used to label detections."""

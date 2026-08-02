@@ -129,6 +129,16 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = False
     scheduler_workers: int = Field(default=2, ge=1)
     scheduler_stream_queue_capacity: int = Field(default=2, ge=1)
+
+    # Dynamic batching (opt-in). Disabled by default: every stream owns its own
+    # detector and infers one frame at a time, exactly as before. When enabled,
+    # streams sharing an identical detector configuration share one model and
+    # their concurrently-ready frames are fused into a single forward pass,
+    # improving accelerator throughput. Per-stream ordering, tracking, and the
+    # REST/WebSocket/DB contracts are unchanged.
+    batching_enabled: bool = False
+    batch_max_size: int = Field(default=8, ge=1)
+    batch_max_wait_ms: int = Field(default=10, ge=0)
     event_buffer_capacity: int = Field(default=1000, ge=1)
     event_ws_queue_capacity: int = Field(default=100, ge=1)
 

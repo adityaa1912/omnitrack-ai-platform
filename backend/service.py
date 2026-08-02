@@ -38,6 +38,7 @@ from inference.events.regions import CrossingLine, Zone
 from .models import Detection as DetectionRecord, StreamSession, create_session_factory
 from .event_store import EventStore
 from .scheduler import InferenceScheduler
+from .batching import BatchManager, detector_signature
 from .observability import correlation, metrics
 from .observability.errors import log_error
 from .observability.logging import get_logger
@@ -113,7 +114,7 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None) -> None:
+    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None) -> None:
         self.config = config
         # Thread-safe session registry (scoped_session). Each thread that writes
         # obtains its OWN session via `self._session_factory()` and releases it
@@ -125,6 +126,15 @@ class InferenceStream:
         # scheduler's pinned worker instead of processed inline. None ==> the
         # legacy one-thread-per-stream loop, byte-for-byte unchanged.
         self._scheduler = scheduler
+
+        # Optional dynamic-batching manager. When set, this stream shares a
+        # detector with other streams of the same detector signature and routes
+        # inference through a coordinator that fuses concurrent forward passes.
+        # None ==> this stream owns a private Detector and infers one frame at a
+        # time, exactly as before.
+        self._batch_manager = batch_manager
+        self._coordinator = None
+        self._detector_signature = None
 
         # Components
         self.frame_source = None
@@ -240,7 +250,16 @@ class InferenceStream:
             benchmark_runs=self.config.inference_benchmark_runs,
         )
         load_start = time.perf_counter()
-        self.detector = Detector(detector_config)
+        if self._batch_manager is not None:
+            # Share one detector across all streams of this signature and route
+            # inference through the coordinator (which fuses concurrent forward
+            # passes). The detector is built/loaded once per signature.
+            self._detector_signature = detector_signature(detector_config)
+            self.detector, self._coordinator = self._batch_manager.acquire(
+                detector_config
+            )
+        else:
+            self.detector = Detector(detector_config)
         provider_name = getattr(self.detector.provider, "name", "unknown")
         metrics.INFERENCE_PROVIDER_LOAD_TIME.labels(
             provider=provider_name
@@ -293,7 +312,14 @@ class InferenceStream:
         """Clean up resources."""
         if self.frame_source is not None:
             self.frame_source.close()
-        if self.detector is not None:
+        if self._coordinator is not None:
+            # Shared detector: drop this stream's reference; the manager stops
+            # and frees the model only when the last stream of this signature
+            # goes away. Never null a model other streams may still be using.
+            if self._batch_manager is not None and self._detector_signature is not None:
+                self._batch_manager.release(self._detector_signature)
+            self._coordinator = None
+        elif self.detector is not None:
             self.detector.model = None
 
     def _run(self) -> None:
@@ -436,6 +462,17 @@ class InferenceStream:
             correlation.clear_stream_context()
             logger.info(f"Capture loop finished for {self.config.stream_id}")
 
+    def _infer(self, frame: Frame):
+        """Run inference for one frame, batching via the coordinator when set.
+
+        The single seam between the per-frame pipeline and dynamic batching: with
+        a coordinator, concurrent same-signature streams fuse into one forward
+        pass; without one, this is the original direct single-frame call.
+        """
+        if self._coordinator is not None:
+            return self._coordinator.predict(frame)
+        return self.detector.predict(frame)
+
     def _process_frame(self, frame: Frame, db) -> float:
         """Process one captured frame end-to-end on the calling thread's session.
 
@@ -452,7 +489,7 @@ class InferenceStream:
         frame_start = time.perf_counter()
         # Run inference (model forward pass + result parsing).
         infer_start = time.perf_counter()
-        result = self.detector.predict(frame)
+        result = self._infer(frame)
         last_infer_at = time.perf_counter()
         metrics.observe_pipeline_stage(
             self.config.stream_id,
@@ -728,6 +765,9 @@ class InferenceService:
         scheduler_enabled: bool = False,
         scheduler_workers: int = 2,
         scheduler_stream_queue_capacity: int = 2,
+        batching_enabled: bool = False,
+        batch_max_size: int = 8,
+        batch_max_wait_ms: int = 10,
     ) -> None:
         # Thread-safe DB access: one engine + a scoped_session registry shared by
         # every stream thread, each of which uses its own thread-local session.
@@ -762,6 +802,25 @@ class InferenceService:
         self._scheduler_workers = scheduler_workers
         self._scheduler_stream_queue_capacity = scheduler_stream_queue_capacity
         self._scheduler_lock = threading.Lock()
+
+        # Optional dynamic batching. Built lazily on first use so the default
+        # (disabled) deployment never constructs a batch manager at startup.
+        self._batch_manager: Optional[BatchManager] = None
+        self._batching_enabled = batching_enabled
+        self._batch_max_size = batch_max_size
+        self._batch_max_wait_ms = batch_max_wait_ms
+        self._batch_manager_lock = threading.Lock()
+
+    def _get_batch_manager(self) -> Optional[BatchManager]:
+        """Return the lazy-built batch manager, or None when batching is disabled."""
+        if not self._batching_enabled:
+            return None
+        with self._batch_manager_lock:
+            if self._batch_manager is None:
+                self._batch_manager = BatchManager(
+                    self._batch_max_size, self._batch_max_wait_ms
+                )
+            return self._batch_manager
 
     def _get_scheduler(self) -> Optional[InferenceScheduler]:
         """Return the lazy-built scheduler, or None when scheduling is disabled."""
@@ -847,6 +906,7 @@ class InferenceService:
             self.Session,
             event_buffer=self.event_store.get_or_create(config.stream_id),
             scheduler=self._get_scheduler(),
+            batch_manager=self._get_batch_manager(),
         )
         # Subscribe the derived-event publisher (Kafka bus) to this stream's
         # buffer. Guarded so a misbehaving publisher can never block a start.
@@ -920,6 +980,11 @@ class InferenceService:
         # capture thread has been stopped, so no worker is processing a stream.
         if self._scheduler is not None:
             self._scheduler.stop()
+
+        # Stop every batch coordinator (if batching was ever used) after all
+        # streams have released their shared detectors.
+        if self._batch_manager is not None:
+            self._batch_manager.stop_all()
 
         # Release the shutdown thread's session, then close all connections.
         self.Session.remove()

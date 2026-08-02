@@ -165,13 +165,7 @@ class Detector:
 
         # Resize once, only when an inference resolution is configured and it
         # differs from the source. Otherwise the frame is used as-is (no copy).
-        data = frame.data
-        iw = self.config.inference_width
-        ih = self.config.inference_height
-        if iw > 0 and ih > 0 and (data.shape[1] != iw or data.shape[0] != ih):
-            import cv2
-
-            data = cv2.resize(data, (iw, ih), interpolation=cv2.INTER_LINEAR)
+        data = self._resize_for_inference(frame.data)
 
         raw = self._predict_with_fallback(data)
 
@@ -185,6 +179,49 @@ class Detector:
             inference_time_ms=inference_time_ms,
             model_name=self.config.model_name,
         )
+
+    def _resize_for_inference(self, data):
+        """Resize a BGR frame to the configured inference resolution, if any.
+
+        Shared by the single-frame and batched paths so the preprocessing that
+        precedes the forward pass lives in exactly one place. Returns the input
+        unchanged (no copy) when no inference resolution is set or it already
+        matches.
+        """
+        iw = self.config.inference_width
+        ih = self.config.inference_height
+        if iw > 0 and ih > 0 and (data.shape[1] != iw or data.shape[0] != ih):
+            import cv2
+
+            return cv2.resize(data, (iw, ih), interpolation=cv2.INTER_LINEAR)
+        return data
+
+    def predict_batch(self, frames: list[Frame]) -> list[InferenceResult]:
+        """Run inference on several frames in a single fused forward pass.
+
+        Preprocessing and result parsing are identical to :meth:`predict`; only
+        the forward pass is batched, via the provider's ``predict_batch`` (a true
+        batch on torch, a sequential fallback elsewhere). The measured batch time
+        is amortized evenly across the frames so per-frame ``inference_time_ms``
+        stays comparable to the single-frame path.
+        """
+        if not frames:
+            return []
+        start_time = time.time()
+        batch = [self._resize_for_inference(f.data) for f in frames]
+        raws = self.provider.predict_batch(batch)
+        per_frame_ms = ((time.time() - start_time) * 1000) / len(frames)
+        results = []
+        for frame, raw in zip(frames, raws):
+            results.append(
+                InferenceResult(
+                    frame=frame,
+                    detections=self._parse_results(raw),
+                    inference_time_ms=per_frame_ms,
+                    model_name=self.config.model_name,
+                )
+            )
+        return results
 
     def _predict_with_fallback(self, data):
         """Run the forward pass, recovering once if the provider fails at runtime.

@@ -228,6 +228,36 @@ INFERENCE_FRAME_LATENCY = Histogram(
     registry=registry,
 )
 
+# ---------------------------------------------------------------------------
+# Dynamic batching (optional shared-detector forward-pass fusion)
+# ---------------------------------------------------------------------------
+
+# Frames per fused forward pass. Distribution centers on the achieved batch
+# size; the low end reflects the single-frame fast path and partial batches.
+BATCH_SIZE = Histogram(
+    "omnitrack_batch_size",
+    "Frames per fused inference forward pass.",
+    buckets=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32),
+    registry=registry,
+)
+
+# Wall time of a fused batch forward pass, including per-image preprocessing
+# and postprocessing.
+BATCH_LATENCY = Histogram(
+    "omnitrack_batch_latency_seconds",
+    "Fused batch forward-pass wall time in seconds.",
+    buckets=(0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
+    registry=registry,
+)
+
+# Achieved batch size as a fraction of the configured maximum (0-1). Reflects
+# how well concurrent frame availability fills each batch.
+BATCHING_EFFICIENCY = Gauge(
+    "omnitrack_batching_efficiency",
+    "Last fused batch size as a fraction of the configured maximum (0-1).",
+    registry=registry,
+)
+
 # Per-stage latency within the inference pipeline. The ``stage`` label names
 # the pipeline stage (capture/preprocess/inference/tracking/event/render/
 # serialize) so a slow stage can be isolated from the end-to-end frame latency.

@@ -68,6 +68,18 @@ class TorchProvider(InferenceProvider):
         )
         return self._to_raw(results[0])
 
+    def predict_batch(self, batch: List[np.ndarray]) -> List[List[RawDetection]]:
+        if self.model is None:
+            raise RuntimeError("TorchProvider model not loaded.")
+        results = self.model.predict(
+            list(batch),
+            conf=self.config.confidence_threshold,
+            iou=self.config.iou_threshold,
+            half=self._use_fp16(),
+            verbose=False,
+        )
+        return [self._to_raw(r) for r in results]
+
     def _to_raw(self, result) -> List[RawDetection]:
         if result.boxes is None or len(result.boxes) == 0:
             return []
