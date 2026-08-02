@@ -135,6 +135,25 @@ INFERENCE_FPS = Gauge(
     registry=registry,
 )
 
+# Which inference backend is active, as an info-style gauge fixed at 1 with a
+# ``provider`` label ("torch", "onnx", "openvino", "tensorrt"). Set once at startup.
+INFERENCE_PROVIDER = Gauge(
+    "omnitrack_inference_provider",
+    "Active inference provider (torch|onnx|openvino|tensorrt); fixed at 1 with a provider label.",
+    labelnames=("provider",),
+    registry=registry,
+)
+
+# Wall time spent loading the inference provider (model load/export/compile),
+# fixed at 1 with a provider label so the active provider's load cost is
+# queryable without label churn. Set once at startup.
+INFERENCE_PROVIDER_LOAD_TIME = Gauge(
+    "omnitrack_inference_provider_load_time_seconds",
+    "Inference provider model load time in seconds; fixed at 1 with a provider label.",
+    labelnames=("provider",),
+    registry=registry,
+)
+
 # Model forward-pass latency distribution.
 MODEL_INFERENCE_LATENCY = Histogram(
     "omnitrack_model_inference_latency_seconds",
@@ -150,6 +169,17 @@ INFERENCE_FRAME_LATENCY = Histogram(
     "End-to-end per-frame pipeline latency in seconds, by stream.",
     labelnames=("stream_id",),
     buckets=(0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
+    registry=registry,
+)
+
+# Per-stage latency within the inference pipeline. The ``stage`` label names
+# the pipeline stage (capture/preprocess/inference/tracking/event/render/
+# serialize) so a slow stage can be isolated from the end-to-end frame latency.
+PIPELINE_STAGE_LATENCY = Histogram(
+    "omnitrack_pipeline_stage_latency_seconds",
+    "Latency of an individual inference pipeline stage",
+    labelnames=("stream_id", "stage"),
+    buckets=(0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
     registry=registry,
 )
 
@@ -249,6 +279,18 @@ BUILD_INFO = Gauge(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def observe_pipeline_stage(stream_id: str, stage: str, duration_ms: float) -> None:
+    """Record one pipeline stage's latency.
+
+    Cheap, single-metric helper so the hot loop can time individual stages
+    (capture/preprocess/inference/tracking/event/render/serialize) without
+    repeating label/second-conversion boilerplate.
+    """
+    PIPELINE_STAGE_LATENCY.labels(stream_id=stream_id, stage=stage).observe(
+        max(duration_ms, 0.0) / 1000.0
+    )
+
 
 def observe_inference(
     stream_id: str,

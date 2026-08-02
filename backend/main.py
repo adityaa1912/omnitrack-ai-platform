@@ -138,6 +138,18 @@ service = InferenceService(
     connect_retry_delay_seconds=settings.db_connect_retry_delay_seconds,
 )
 
+# Record the active inference provider as an info-style gauge and log it at
+# startup so the selected backend is visible in both /metrics and the logs.
+from .observability import metrics as _metrics
+
+_metrics.INFERENCE_PROVIDER.labels(provider=settings.inference_provider).set(1)
+logger.info(
+    "Inference provider selected: provider=%s model=%s device=%s",
+    settings.inference_provider,
+    settings.model_path,
+    settings.inference_device,
+)
+
 # ---------------------------------------------------------------------------
 # Optional Redis cache. Disabled by default (``redis_enabled=False``); when
 # enabled the client connects lazily so an unreachable Redis never blocks
@@ -194,6 +206,44 @@ def _check_model_available() -> CheckResult:
     if os.path.exists(path):
         return CheckResult(name="model", ok=True, detail=f"model file present: {path}")
     return CheckResult(name="model", ok=False, detail=f"model file missing: {path}")
+
+
+def _check_onnx_provider() -> CheckResult:
+    """Readiness: when an accelerated provider is selected, it must load.
+
+    In torch mode (the default) this check passes trivially and reports
+    ``torch`` so the backend is ready without any optional runtime. In onnx,
+    openvino, tensorrt, or auto mode it constructs the Detector's selected
+    provider against the (exported/cached) graph to prove the runtime and
+    model are usable, so a broken export or missing dependency surfaces as
+    not-ready. Auto mode is always ready: it falls back to torch when no
+    accelerated backend loads.
+    """
+    if settings.inference_provider == "torch":
+        return CheckResult(name="onnx_provider", ok=True, detail="torch mode")
+    try:
+        from inference.config import DetectorConfig
+        from inference.detector import _build_provider
+
+        cfg = DetectorConfig(
+            model_name=settings.model_path,
+            device=settings.inference_device,
+            inference_width=settings.inference_width,
+            inference_height=settings.inference_height,
+            inference_provider=settings.inference_provider,
+        )
+        provider = _build_provider(cfg)
+        if not getattr(provider, "_auto_loaded", False):
+            provider.load()
+        return CheckResult(
+            name="onnx_provider", ok=True, detail=f"{provider.name} loaded"
+        )
+    except Exception as exc:  # noqa: BLE001 - a failing check is data
+        if settings.inference_provider == "auto":
+            return CheckResult(
+                name="onnx_provider", ok=True, detail=f"auto fallback ({exc})"
+            )
+        return CheckResult(name="onnx_provider", ok=False, detail=str(exc))
 
 
 def _check_stream_manager() -> CheckResult:
@@ -272,6 +322,7 @@ def _check_kafka() -> CheckResult:
 
 readiness_probe.register(_check_configuration)
 readiness_probe.register(_check_model_available)
+readiness_probe.register(_check_onnx_provider)
 readiness_probe.register(_check_stream_manager)
 readiness_probe.register(_check_database)
 readiness_probe.register(_check_redis)
@@ -679,6 +730,13 @@ async def start_stream(request: StartStreamRequest):
             source_backoff_factor=settings.inference_backoff_factor,
             stop_timeout_seconds=settings.stream_stop_timeout_seconds,
             frame_queue_capacity=settings.frame_queue_capacity,
+            inference_target_fps=settings.inference_target_fps,
+            frame_skip=settings.frame_skip,
+            inference_width=settings.inference_width,
+            inference_height=settings.inference_height,
+            enable_fp16=settings.enable_fp16,
+            adaptive_frame_drop=settings.adaptive_frame_drop,
+            inference_provider=settings.inference_provider,
             zones=zones,
             lines=lines,
             dwell_seconds=request.dwell_seconds,

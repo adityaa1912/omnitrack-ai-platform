@@ -91,6 +91,29 @@ class Settings(BaseSettings):
     stream_stop_timeout_seconds: float = Field(default=5.0, gt=0)
     frame_queue_capacity: int = Field(default=30, ge=1)
     frame_ws_poll_timeout_seconds: float = Field(default=1.0, gt=0)
+
+    # Inference-pipeline performance tuning. All optional with safe defaults
+    # that preserve current behavior (no skipping, no FPS cap, source-native
+    # resolution, FP32, adaptive drop on). These only tune throughput/latency;
+    # they do not change any API, schema, or event semantics.
+    # Cap on inference iterations per second; 0 = uncapped (every frame).
+    inference_target_fps: float = Field(default=0.0, ge=0)
+    # Process 1 in (frame_skip+1) frames for inference; 0 = process every frame.
+    frame_skip: int = Field(default=0, ge=0)
+    # Optional inference input resolution; 0 = use the source frame as-is.
+    inference_width: int = Field(default=0, ge=0)
+    inference_height: int = Field(default=0, ge=0)
+    # Enable FP16 half-precision inference when the device supports it (GPU).
+    enable_fp16: bool = False
+    # Drop stale queued frames so the newest frame is always processed first.
+    adaptive_frame_drop: bool = True
+    # Inference backend: "torch" (default, ultralytics/PyTorch), "onnx"
+    # (ONNX Runtime CPUExecutionProvider), "openvino" (Intel CPU/iGPU),
+    # "tensorrt" (NVIDIA CUDA), or "auto" (pick the fastest available:
+    # tensorrt -> openvino -> onnx -> torch, with graceful fallback). The
+    # accelerator providers export the .pt weights to a cached graph/engine on
+    # first use. Optional and backwards compatible.
+    inference_provider: Literal["torch", "onnx", "openvino", "tensorrt", "auto"] = "torch"
     event_buffer_capacity: int = Field(default=1000, ge=1)
     event_ws_queue_capacity: int = Field(default=100, ge=1)
 

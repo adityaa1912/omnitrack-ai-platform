@@ -13,6 +13,18 @@ class DetectorConfig:
     confidence_threshold: float = 0.5
     iou_threshold: float = 0.45
     device: str = "cpu"
+    # Optional inference input resolution; (0, 0) = use the source frame as-is.
+    # When set, frames are resized once before the forward pass, reducing the
+    # model's input size (and so its latency) at the cost of some accuracy.
+    inference_width: int = 0
+    inference_height: int = 0
+    # Enable FP16 half-precision when the device supports it (GPU only; on CPU
+    # this is a no-op). Halves memory and can speed up the forward pass.
+    enable_fp16: bool = False
+    # Inference backend: "torch" (ultralytics/PyTorch, default) or "onnx"
+    # (ONNX Runtime CPUExecutionProvider). Selecting "onnx" exports the .pt
+    # weights to a cached .onnx graph on first use and runs that instead.
+    inference_provider: str = "torch"
 
 
 @dataclass

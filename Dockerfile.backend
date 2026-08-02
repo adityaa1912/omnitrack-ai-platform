@@ -3,8 +3,14 @@
 # CPU baseline image. It intentionally runs one Uvicorn worker because stream
 # ownership, EventBuffer subscriptions, and WebSocket lifecycle state are
 # process-local in the current architecture.
+#
+# Optional build arg: ``--build-arg INSTALL_OPENVINO=1`` installs the OpenVINO
+# runtime so OMNITRACK_INFERENCE_PROVIDER=openvino / auto can use Intel CPU/iGPU
+# acceleration. Without it the image stays a pure CPU baseline and openvino mode
+# falls back to onnx/torch.
 FROM python:3.11-slim-bookworm
 
+ARG INSTALL_OPENVINO=0
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -35,6 +41,11 @@ RUN python -m pip install --index-url https://download.pytorch.org/whl/cpu \
 # Install the remaining dependencies. torch/torchvision are already satisfied
 # by the CPU wheels above, so pip will not re-download the CUDA builds.
 RUN python -m pip install -r requirements.txt
+
+# Optionally install the OpenVINO runtime (Intel CPU/iGPU acceleration). Kept
+# out of requirements.txt so the CPU baseline image does not carry it; enabled
+# with --build-arg INSTALL_OPENVINO=1.
+RUN if [ "$INSTALL_OPENVINO" = "1" ]; then python -m pip install openvino; fi
 
 COPY . ./
 
