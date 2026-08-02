@@ -22,6 +22,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
+
+# Install CPU-only PyTorch wheels first, from the official PyTorch CPU index.
+# The default PyPI ``torch``/``torchvision`` wheels are CUDA builds that pull in
+# several GB of nvidia-* runtime libraries (cublas, cudnn, cufft, cusolver,
+# cusparse, ...). This is a CPU-only deployment, so we install the same versions
+# from the CPU wheel index instead. Keeping this as its own RUN layer means the
+# large torch download is cached and only re-runs when the torch pins change.
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.12.0 torchvision==0.27.0
+
+# Install the remaining dependencies. torch/torchvision are already satisfied
+# by the CPU wheels above, so pip will not re-download the CUDA builds.
 RUN python -m pip install -r requirements.txt
 
 COPY . ./

@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     db_connect_max_attempts: int = Field(default=5, ge=1)
     db_connect_retry_delay_seconds: float = Field(default=1.0, gt=0)
 
+    # Redis cache (optional). Disabled by default so local development runs
+    # without Redis; enable with ``OMNITRACK_REDIS_ENABLED=true`` and point
+    # ``OMNITRACK_REDIS_URL`` at a server. When disabled or unreachable the
+    # backend runs normally — caching is simply bypassed.
+    redis_enabled: bool = False
+    redis_socket_timeout_seconds: float = Field(default=2.0, gt=0)
+    redis_socket_connect_timeout_seconds: float = Field(default=2.0, gt=0)
+    redis_max_connections: int = Field(default=10, ge=1)
+    # Default TTL (seconds) applied to cached entries when a caller does not
+    # specify one. Short-lived: cached reads are near-real-time projections.
+    redis_default_ttl_seconds: int = Field(default=5, ge=1)
+
     model_path: str = Field(default="yolov8n.pt", min_length=1)
     inference_device: str = Field(default="cpu", min_length=1)
     inference_source_retry_attempts: int = Field(default=3, ge=1)
@@ -164,6 +176,17 @@ class Settings(BaseSettings):
     def database_is_sqlite(self) -> bool:
         """Whether the resolved database URL targets SQLite."""
         return self.database_url.startswith("sqlite")
+
+    @property
+    def resolved_redis_url(self) -> str | None:
+        """Return the Redis URL when caching is enabled, else ``None``.
+
+        Returns ``None`` when ``redis_enabled`` is false so callers can treat
+        "no URL" as "caching disabled" without a separate flag check.
+        """
+        if not self.redis_enabled or self.redis_url is None:
+            return None
+        return str(self.redis_url)
 
 
 @lru_cache(maxsize=1)

@@ -19,6 +19,23 @@ services:
       start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS:-20}s"
       retries: ${OMNITRACK_HEALTHCHECK_RETRIES:-3}
 
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    networks:
+      - omnitrack
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - "redis-cli"
+        - "ping"
+      interval: "${OMNITRACK_HEALTHCHECK_INTERVAL_SECONDS:-30}s"
+      timeout: "${OMNITRACK_HEALTHCHECK_TIMEOUT_SECONDS:-5}s"
+      start_period: "${OMNITRACK_HEALTHCHECK_START_PERIOD_SECONDS:-20}s"
+      retries: ${OMNITRACK_HEALTHCHECK_RETRIES:-3}
+
   backend:
     build:
       context: .
@@ -30,6 +47,8 @@ services:
     environment:
       OMNITRACK_ENVIRONMENT: container
       OMNITRACK_POSTGRES_URL: ${OMNITRACK_POSTGRES_URL:-postgresql+psycopg://omnitrack:omnitrack@postgres:5432/omnitrack}
+      OMNITRACK_REDIS_ENABLED: ${OMNITRACK_REDIS_ENABLED:-true}
+      OMNITRACK_REDIS_URL: ${OMNITRACK_REDIS_URL:-redis://redis:6379/0}
     ports:
       - "${OMNITRACK_API_PORT:-8000}:${OMNITRACK_API_PORT:-8000}"
     volumes:
@@ -40,6 +59,8 @@ services:
     stop_grace_period: "${OMNITRACK_CONTAINER_STOP_GRACE_PERIOD_SECONDS:-15}s"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test:
@@ -90,6 +111,8 @@ volumes:
     name: omnitrack-backend-data
   postgres-data:
     name: omnitrack-postgres-data
+  redis-data:
+    name: omnitrack-redis-data
 
 networks:
   omnitrack:

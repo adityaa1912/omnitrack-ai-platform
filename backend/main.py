@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from .service import InferenceService, StreamConfig, StreamMetrics
 from .settings import get_settings
+from .cache import JsonCache, create_redis_client
 from .observability import correlation
 from .observability import metrics as om
 from .observability.errors import log_error
@@ -137,6 +138,20 @@ service = InferenceService(
 )
 
 # ---------------------------------------------------------------------------
+# Optional Redis cache. Disabled by default (``redis_enabled=False``); when
+# enabled the client connects lazily so an unreachable Redis never blocks
+# startup — every cache operation degrades to a safe no-op on failure.
+# ---------------------------------------------------------------------------
+
+redis_client = create_redis_client(
+    settings.resolved_redis_url,
+    max_connections=settings.redis_max_connections,
+    socket_timeout=settings.redis_socket_timeout_seconds,
+    socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+)
+cache = JsonCache(redis_client, default_ttl_seconds=settings.redis_default_ttl_seconds)
+
+# ---------------------------------------------------------------------------
 # Observability: readiness probe + background system sampler.
 # ---------------------------------------------------------------------------
 
@@ -206,10 +221,26 @@ def _check_configuration() -> CheckResult:
         return CheckResult(name="configuration", ok=False, detail=str(exc))
 
 
+def _check_redis() -> CheckResult:
+    """Readiness: report Redis cache status.
+
+    When the cache is disabled (the default) the check passes and reports
+    ``disabled`` so the backend is ready without Redis. When enabled, a live
+    ``PING`` gates readiness so a configured-but-unreachable Redis surfaces as
+    not-ready.
+    """
+    if redis_client is None:
+        return CheckResult(name="redis", ok=True, detail="disabled")
+    if redis_client.ping():
+        return CheckResult(name="redis", ok=True, detail="reachable")
+    return CheckResult(name="redis", ok=False, detail="unreachable")
+
+
 readiness_probe.register(_check_configuration)
 readiness_probe.register(_check_model_available)
 readiness_probe.register(_check_stream_manager)
 readiness_probe.register(_check_database)
+readiness_probe.register(_check_redis)
 
 
 class StreamWebSocketManager:
@@ -282,6 +313,8 @@ async def lifespan(_app: FastAPI):
         logger.info("Application shutdown: stopping streams and disposing resources")
         stream_websockets.close_all()
         await asyncio.to_thread(service.shutdown)
+        if redis_client is not None:
+            redis_client.close()
         system_sampler.stop()
         shutdown_logging()
 
@@ -652,10 +685,15 @@ async def stop_stream(stream_id: str):
 @app.get("/stream/{stream_id}/metrics", response_model=MetricsResponse)
 async def get_metrics(stream_id: str):
     """Get metrics for a specific stream."""
+    cache_key = f"stream:{stream_id}:metrics"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return MetricsResponse(**cached)
+
     try:
         metrics = service.get_stream_metrics(stream_id)
 
-        return MetricsResponse(
+        response = MetricsResponse(
             stream_id=metrics.stream_id,
             fps=metrics.fps,
             total_frames=metrics.total_frames,
@@ -664,6 +702,8 @@ async def get_metrics(stream_id: str):
             is_active=metrics.is_active,
             error_message=metrics.error_message,
         )
+        cache.set(cache_key, response.model_dump())
+        return response
 
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -672,6 +712,11 @@ async def get_metrics(stream_id: str):
 @app.get("/stream/{stream_id}/detections", response_model=List[DetectionResponse])
 async def get_detections(stream_id: str):
     """Get latest detections from a stream."""
+    cache_key = f"stream:{stream_id}:detections"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return [DetectionResponse(**item) for item in cached]
+
     try:
         tracked_objects = service.get_stream_detections(stream_id)
 
@@ -692,6 +737,7 @@ async def get_detections(stream_id: str):
                         track_id=obj.track_id,
                     )
                 )
+        cache.set(cache_key, [d.model_dump() for d in detections])
         return detections
 
     except ValueError as e:
