@@ -154,6 +154,62 @@ INFERENCE_PROVIDER_LOAD_TIME = Gauge(
     registry=registry,
 )
 
+# Wall time of the one-time provider benchmark sweep (auto mode only). 0 when
+# benchmarking is disabled or served from cache. Set once at startup.
+INFERENCE_BENCHMARK_DURATION = Gauge(
+    "omnitrack_inference_benchmark_duration_seconds",
+    "Duration of the one-time provider benchmark sweep in seconds.",
+    registry=registry,
+)
+
+# Benchmark score (throughput, FPS) of each candidate provider, labelled by
+# provider. Higher is better; the highest-scoring provider is selected.
+INFERENCE_PROVIDER_SCORE = Gauge(
+    "omnitrack_inference_provider_score",
+    "Benchmark score (throughput FPS) per provider from the selection sweep.",
+    labelnames=("provider",),
+    registry=registry,
+)
+
+# ---------------------------------------------------------------------------
+# Scheduler (optional central worker pool)
+# ---------------------------------------------------------------------------
+
+# Per-stream input-channel depth in the scheduler. Bounded by the configured
+# stream queue capacity; the scheduler drops the oldest frame when a channel is
+# full (counted in DROPPED_FRAMES_TOTAL, reused — no separate drop metric).
+SCHEDULER_QUEUE_DEPTH = Gauge(
+    "omnitrack_scheduler_queue_depth",
+    "Current per-stream input-queue depth in the inference scheduler.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+# Fraction of the scheduler worker pool currently busy (busy / total workers).
+SCHEDULER_WORKER_UTILIZATION = Gauge(
+    "omnitrack_scheduler_worker_utilization",
+    "Fraction of inference-scheduler workers currently busy (0-1).",
+    registry=registry,
+)
+
+# End-to-end scheduler latency: frame submit -> processing completion.
+SCHEDULER_STREAM_LATENCY = Histogram(
+    "omnitrack_scheduler_stream_latency_seconds",
+    "Time from frame submit to processing completion in the scheduler, by stream.",
+    labelnames=("stream_id",),
+    buckets=(0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0),
+    registry=registry,
+)
+
+# Queue-wait latency: frame submit -> worker pickup (scheduling delay only).
+SCHEDULER_LATENCY = Histogram(
+    "omnitrack_scheduler_latency_seconds",
+    "Time a frame waits in the scheduler queue before worker pickup, by stream.",
+    labelnames=("stream_id",),
+    buckets=(0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5),
+    registry=registry,
+)
+
 # Model forward-pass latency distribution.
 MODEL_INFERENCE_LATENCY = Histogram(
     "omnitrack_model_inference_latency_seconds",

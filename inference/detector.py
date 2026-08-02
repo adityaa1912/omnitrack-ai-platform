@@ -71,6 +71,16 @@ def _build_auto_provider(config: DetectorConfig):
     candidates.append(ONNXProvider)
     candidates.append(TorchProvider)
 
+    if getattr(config, "benchmark_enabled", False):
+        from backend.inference import benchmark
+
+        try:
+            return benchmark.select_provider(config, candidates)
+        except Exception as e:  # noqa: BLE001 - fall back to fixed priority
+            logger.warning(
+                f"Provider benchmarking failed ({e}); using fixed priority order"
+            )
+
     last_error: Optional[Exception] = None
     for builder in candidates:
         provider = builder(config)
@@ -163,7 +173,7 @@ class Detector:
 
             data = cv2.resize(data, (iw, ih), interpolation=cv2.INTER_LINEAR)
 
-        raw = self.provider.predict(data)
+        raw = self._predict_with_fallback(data)
 
         inference_time_ms = (time.time() - start_time) * 1000
 
@@ -175,6 +185,51 @@ class Detector:
             inference_time_ms=inference_time_ms,
             model_name=self.config.model_name,
         )
+
+    def _predict_with_fallback(self, data):
+        """Run the forward pass, recovering once if the provider fails at runtime.
+
+        A provider that starts raising mid-stream (e.g. a device/driver fault on
+        an accelerator) is rebuilt to the next backend in the fixed priority
+        order and the frame is retried, so a runtime provider failure degrades
+        instead of killing the stream. If no fallback is available the original
+        error propagates.
+        """
+        try:
+            return self.provider.predict(data)
+        except Exception as exc:  # noqa: BLE001 - attempt one live fallback
+            if getattr(self, "_fallback_exhausted", False):
+                raise
+            logger.warning(
+                f"Provider {getattr(self.provider, 'name', '?')} failed at "
+                f"runtime ({exc}); falling back"
+            )
+            if not self._rebuild_fallback_provider():
+                self._fallback_exhausted = True
+                raise
+            return self.provider.predict(data)
+
+    def _rebuild_fallback_provider(self) -> bool:
+        """Rebuild ``self.provider`` as ONNX then torch, skipping the failed one.
+
+        Returns True when a different provider loaded successfully.
+        """
+        from backend.inference.providers import ONNXProvider, TorchProvider
+
+        current = getattr(self.provider, "name", "")
+        for builder in (ONNXProvider, TorchProvider):
+            if builder.name == current:
+                continue
+            try:
+                provider = builder(self.config)
+                provider.load()
+                self.provider = provider
+                return True
+            except Exception as e:  # noqa: BLE001 - try the next fallback
+                logger.warning(
+                    f"Runtime fallback to {builder.__name__} failed ({e})"
+                )
+        return False
 
     def _parse_results(self, raw) -> list[Detection]:
         """

@@ -37,6 +37,7 @@ from inference.events import EventEngine, EventEngineConfig
 from inference.events.regions import CrossingLine, Zone
 from .models import Detection as DetectionRecord, StreamSession, create_session_factory
 from .event_store import EventStore
+from .scheduler import InferenceScheduler
 from .observability import correlation, metrics
 from .observability.errors import log_error
 from .observability.logging import get_logger
@@ -84,6 +85,9 @@ class StreamConfig:
     adaptive_frame_drop: bool = True
     # Inference backend: "torch" (default) or "onnx". See Settings.
     inference_provider: str = "torch"
+    # Auto mode only: benchmark providers once and pick the fastest. See Settings.
+    inference_benchmark_enabled: bool = False
+    inference_benchmark_runs: int = 5
 
     # Scene geometry consumed by the event engine's zone/line detectors. Empty
     # by default => those detectors stay inert (behaviorally unchanged). Built
@@ -109,12 +113,18 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, session_factory, event_buffer=None) -> None:
+    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None) -> None:
         self.config = config
         # Thread-safe session registry (scoped_session). Each thread that writes
         # obtains its OWN session via `self._session_factory()` and releases it
         # with `.remove()` when done; a Session is never shared across threads.
         self._session_factory = session_factory
+
+        # Optional central scheduler. When set, capture is decoupled from the
+        # infer/track/render stage: this stream's frames are submitted to the
+        # scheduler's pinned worker instead of processed inline. None ==> the
+        # legacy one-thread-per-stream loop, byte-for-byte unchanged.
+        self._scheduler = scheduler
 
         # Components
         self.frame_source = None
@@ -148,7 +158,17 @@ class InferenceStream:
         try:
             self._initialize_components()
             self.is_running = True
-            self.thread = threading.Thread(target=self._run, daemon=True)
+            if self._scheduler is not None:
+                # Decoupled path: pin this stream to a scheduler worker and run a
+                # capture-only thread that submits frames for that worker to
+                # process. The processing (infer/track/render/enqueue/events) is
+                # the SAME `_process_frame` the legacy loop uses — no duplication.
+                self._scheduler.register(
+                    self.config.stream_id, self._process_frame, owner=self
+                )
+                self.thread = threading.Thread(target=self._run_capture, daemon=True)
+            else:
+                self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
 
             # Record the session row on THIS (request) thread's own session.
@@ -196,7 +216,14 @@ class InferenceStream:
         self.is_running = False
         if self.thread is not None:
             self.thread.join(timeout=self.config.stop_timeout_seconds)
-        self._cleanup()
+        # In scheduler mode the capture thread's `finally` already runs
+        # `_cleanup` AFTER waiting for the pinned worker's in-flight frame to
+        # finish (see `_run_capture` / `InferenceScheduler.unregister`). Running
+        # `_cleanup` here too could tear down the detector/frame source while a
+        # worker is still inside `_process_frame`; the legacy loop has no such
+        # split, so it still cleans up here as before.
+        if self._scheduler is None:
+            self._cleanup()
         logger.info(f"Stream {self.config.stream_id} stopped")
 
     def _initialize_components(self) -> None:
@@ -209,12 +236,16 @@ class InferenceStream:
             inference_height=self.config.inference_height,
             enable_fp16=self.config.enable_fp16,
             inference_provider=self.config.inference_provider,
+            benchmark_enabled=self.config.inference_benchmark_enabled,
+            benchmark_runs=self.config.inference_benchmark_runs,
         )
         load_start = time.perf_counter()
         self.detector = Detector(detector_config)
+        provider_name = getattr(self.detector.provider, "name", "unknown")
         metrics.INFERENCE_PROVIDER_LOAD_TIME.labels(
-            provider=getattr(self.detector.provider, "name", "unknown")
+            provider=provider_name
         ).set(time.perf_counter() - load_start)
+        metrics.INFERENCE_PROVIDER.labels(provider=provider_name).set(1)
 
         frame_source_config = FrameSourceConfig(
             source=self.config.source,
@@ -316,124 +347,10 @@ class InferenceStream:
 
                 frame_start = time.perf_counter()
                 try:
-                    # Run inference (model forward pass + result parsing).
-                    infer_start = time.perf_counter()
-                    result = self.detector.predict(frame)
-                    last_infer_at = time.perf_counter()
-                    metrics.observe_pipeline_stage(
-                        self.config.stream_id,
-                        "inference",
-                        (last_infer_at - infer_start) * 1000.0,
-                    )
-                    self.latest_frame = frame
-                    self.metrics.total_frames += 1
-
-                    # Run tracking if enabled
-                    tracking_result = None
-                    if self.tracker is not None:
-                        track_start = time.perf_counter()
-                        tracking_result = self.tracker.update(
-                            result.detections,
-                            frame.frame_id,
-                            frame.timestamp,
-                        )
-                        metrics.observe_pipeline_stage(
-                            self.config.stream_id,
-                            "tracking",
-                            (time.perf_counter() - track_start) * 1000.0,
-                        )
-                        self.latest_detections = tracking_result.tracked_objects
-
-                        # Render with tracking
-                        render_start = time.perf_counter()
-                        output_frame = self.visualizer.render_tracked(
-                            frame.data,
-                            tracking_result,
-                            fps=self.metrics.fps,
-                        )
-                        metrics.observe_pipeline_stage(
-                            self.config.stream_id,
-                            "render",
-                            (time.perf_counter() - render_start) * 1000.0,
-                        )
-                    else:
-                        self.latest_detections = result.detections
-                        render_start = time.perf_counter()
-                        output_frame = self.visualizer.render(
-                            frame.data,
-                            result,
-                            fps=self.metrics.fps,
-                        )
-                        metrics.observe_pipeline_stage(
-                            self.config.stream_id,
-                            "render",
-                            (time.perf_counter() - render_start) * 1000.0,
-                        )
-
-                    # Update metrics
-                    self._update_metrics(result.inference_time_ms, len(result.detections))
-
-                    # Store detections in database
-                    self._store_detections(db, result.detections, frame)
-
-                    # Add to output queue. Adaptive drop: when the queue is full,
-                    # evict the stalest buffered frame and enqueue the newest, so
-                    # consumers always get the freshest frame and latency stays
-                    # bounded instead of growing. When adaptive drop is disabled
-                    # we fall back to dropping the new frame (prior behavior).
-                    enqueued = False
-                    try:
-                        self.output_queue.put_nowait({
-                            "frame": output_frame,
-                            "detections": result.detections,
-                            "timestamp": frame.timestamp,
-                        })
-                        enqueued = True
-                    except Full:
-                        if cfg.adaptive_frame_drop:
-                            try:
-                                self.output_queue.get_nowait()  # evict stalest
-                                self.output_queue.put_nowait({
-                                    "frame": output_frame,
-                                    "detections": result.detections,
-                                    "timestamp": frame.timestamp,
-                                })
-                                enqueued = True
-                            except (Full, Empty):
-                                enqueued = False
-                        if not enqueued:
-                            # Counted, not silent: a slow consumer never
-                            # back-pressures the inference loop.
-                            metrics.DROPPED_FRAMES_TOTAL.labels(
-                                stream_id=self.config.stream_id
-                            ).inc()
-
-                    # Record per-frame pipeline metrics (queue depth sampled
-                    # after the put/drop so it reflects the current state).
-                    frame_latency_ms = (time.perf_counter() - frame_start) * 1000.0
-                    metrics.FRAME_QUEUE_DEPTH.labels(
-                        stream_id=self.config.stream_id
-                    ).set(self.output_queue.qsize())
-                    metrics.observe_inference(
-                        stream_id=self.config.stream_id,
-                        inference_time_ms=result.inference_time_ms,
-                        frame_latency_ms=frame_latency_ms,
-                        num_detections=len(result.detections),
-                    )
-
-                    # Derive events AFTER the frame has been queued, so event
-                    # generation sits off the frame-delivery path and can never
-                    # delay or block it. Guarded internally so it can never
-                    # break the inference loop.
-                    if tracking_result is not None:
-                        event_start = time.perf_counter()
-                        self._process_events(tracking_result)
-                        metrics.observe_pipeline_stage(
-                            self.config.stream_id,
-                            "event",
-                            (time.perf_counter() - event_start) * 1000.0,
-                        )
-
+                    # Process the frame inline (infer/track/render/enqueue/events)
+                    # via the shared processor; it returns the post-inference
+                    # timestamp used for the FPS cap.
+                    last_infer_at = self._process_frame(frame, db)
                 except Exception as e:
                     log_error(
                         logger,
@@ -459,6 +376,199 @@ class InferenceStream:
             self._cleanup()
             correlation.clear_stream_context()
             logger.info(f"Inference loop finished for {self.config.stream_id}")
+
+    def _run_capture(self) -> None:
+        """Capture-only loop for the scheduler path (runs in background thread).
+
+        Mirrors `_run`'s capture, frame-skip and FPS-cap gating exactly, but
+        instead of processing a frame inline it submits it to the scheduler,
+        whose pinned worker calls `_process_frame`. Capture is thus decoupled
+        from inference so a slow stream cannot stall the capture loop. This
+        thread owns a session solely to finalize the stream on exit; per-frame
+        persistence happens on the worker's own session.
+        """
+        correlation.bind_stream_context(stream_id=self.config.stream_id)
+        db = self._session_factory()
+        cfg = self.config
+        frame_skip = max(cfg.frame_skip, 0)
+        target_fps = cfg.inference_target_fps
+        min_interval = (1.0 / target_fps) if target_fps and target_fps > 0 else 0.0
+        skip_mod = frame_skip + 1
+        last_submit_at = 0.0
+        try:
+            logger.info(f"Capture loop started for {self.config.stream_id}")
+            frame_iter = self.frame_source.read()
+            while self.is_running:
+                capture_start = time.perf_counter()
+                try:
+                    frame = next(frame_iter)
+                except StopIteration:
+                    break
+                capture_ms = (time.perf_counter() - capture_start) * 1000.0
+                metrics.observe_pipeline_stage(
+                    self.config.stream_id, "capture", capture_ms
+                )
+
+                if not self.is_running:
+                    break
+
+                if frame_skip and (frame.frame_id % skip_mod) != 0:
+                    continue
+
+                if min_interval > 0.0:
+                    now = time.perf_counter()
+                    if (now - last_submit_at) < min_interval:
+                        continue
+
+                self._scheduler.submit(self.config.stream_id, frame)
+                last_submit_at = time.perf_counter()
+
+        finally:
+            # Same finalize-before-terminal-flag ordering the reaper depends on.
+            # Unregister after finalize so a lingering in-flight worker frame
+            # finishes safely; the worker re-checks channel presence.
+            self._finalize_session(db)
+            self._session_factory.remove()
+            self.is_running = False
+            if self._scheduler is not None:
+                self._scheduler.unregister(self.config.stream_id)
+            self._cleanup()
+            correlation.clear_stream_context()
+            logger.info(f"Capture loop finished for {self.config.stream_id}")
+
+    def _process_frame(self, frame: Frame, db) -> float:
+        """Process one captured frame end-to-end on the calling thread's session.
+
+        Runs inference, tracking, rendering, output-queue enqueue (with adaptive
+        drop) and event derivation, updating per-frame metrics. Returns the
+        post-inference `perf_counter` timestamp used by the caller's FPS cap.
+
+        Shared by the legacy inline loop (`_run`) and the scheduler workers, so
+        the inference pipeline lives in exactly one place. It never handles its
+        own termination: a raised exception propagates to the caller, which owns
+        the per-frame error handling (mark failed, stop the stream).
+        """
+        cfg = self.config
+        frame_start = time.perf_counter()
+        # Run inference (model forward pass + result parsing).
+        infer_start = time.perf_counter()
+        result = self.detector.predict(frame)
+        last_infer_at = time.perf_counter()
+        metrics.observe_pipeline_stage(
+            self.config.stream_id,
+            "inference",
+            (last_infer_at - infer_start) * 1000.0,
+        )
+        self.latest_frame = frame
+        self.metrics.total_frames += 1
+
+        # Run tracking if enabled
+        tracking_result = None
+        if self.tracker is not None:
+            track_start = time.perf_counter()
+            tracking_result = self.tracker.update(
+                result.detections,
+                frame.frame_id,
+                frame.timestamp,
+            )
+            metrics.observe_pipeline_stage(
+                self.config.stream_id,
+                "tracking",
+                (time.perf_counter() - track_start) * 1000.0,
+            )
+            self.latest_detections = tracking_result.tracked_objects
+
+            # Render with tracking
+            render_start = time.perf_counter()
+            output_frame = self.visualizer.render_tracked(
+                frame.data,
+                tracking_result,
+                fps=self.metrics.fps,
+            )
+            metrics.observe_pipeline_stage(
+                self.config.stream_id,
+                "render",
+                (time.perf_counter() - render_start) * 1000.0,
+            )
+        else:
+            self.latest_detections = result.detections
+            render_start = time.perf_counter()
+            output_frame = self.visualizer.render(
+                frame.data,
+                result,
+                fps=self.metrics.fps,
+            )
+            metrics.observe_pipeline_stage(
+                self.config.stream_id,
+                "render",
+                (time.perf_counter() - render_start) * 1000.0,
+            )
+
+        # Update metrics
+        self._update_metrics(result.inference_time_ms, len(result.detections))
+
+        # Store detections in database
+        self._store_detections(db, result.detections, frame)
+
+        # Add to output queue. Adaptive drop: when the queue is full,
+        # evict the stalest buffered frame and enqueue the newest, so
+        # consumers always get the freshest frame and latency stays
+        # bounded instead of growing. When adaptive drop is disabled
+        # we fall back to dropping the new frame (prior behavior).
+        enqueued = False
+        try:
+            self.output_queue.put_nowait({
+                "frame": output_frame,
+                "detections": result.detections,
+                "timestamp": frame.timestamp,
+            })
+            enqueued = True
+        except Full:
+            if cfg.adaptive_frame_drop:
+                try:
+                    self.output_queue.get_nowait()  # evict stalest
+                    self.output_queue.put_nowait({
+                        "frame": output_frame,
+                        "detections": result.detections,
+                        "timestamp": frame.timestamp,
+                    })
+                    enqueued = True
+                except (Full, Empty):
+                    enqueued = False
+            if not enqueued:
+                # Counted, not silent: a slow consumer never
+                # back-pressures the inference loop.
+                metrics.DROPPED_FRAMES_TOTAL.labels(
+                    stream_id=self.config.stream_id
+                ).inc()
+
+        # Record per-frame pipeline metrics (queue depth sampled
+        # after the put/drop so it reflects the current state).
+        frame_latency_ms = (time.perf_counter() - frame_start) * 1000.0
+        metrics.FRAME_QUEUE_DEPTH.labels(
+            stream_id=self.config.stream_id
+        ).set(self.output_queue.qsize())
+        metrics.observe_inference(
+            stream_id=self.config.stream_id,
+            inference_time_ms=result.inference_time_ms,
+            frame_latency_ms=frame_latency_ms,
+            num_detections=len(result.detections),
+        )
+
+        # Derive events AFTER the frame has been queued, so event
+        # generation sits off the frame-delivery path and can never
+        # delay or block it. Guarded internally so it can never
+        # break the inference loop.
+        if tracking_result is not None:
+            event_start = time.perf_counter()
+            self._process_events(tracking_result)
+            metrics.observe_pipeline_stage(
+                self.config.stream_id,
+                "event",
+                (time.perf_counter() - event_start) * 1000.0,
+            )
+
+        return last_infer_at
 
     def _finalize_session(self, db) -> None:
         """Close out the StreamSession row and flush any pending detections.
@@ -615,6 +725,9 @@ class InferenceService:
         pool_pre_ping: bool = True,
         connect_max_attempts: int = 1,
         connect_retry_delay_seconds: float = 1.0,
+        scheduler_enabled: bool = False,
+        scheduler_workers: int = 2,
+        scheduler_stream_queue_capacity: int = 2,
     ) -> None:
         # Thread-safe DB access: one engine + a scoped_session registry shared by
         # every stream thread, each of which uses its own thread-local session.
@@ -641,6 +754,27 @@ class InferenceService:
         # to each stream's event buffer at stream start. ``None`` = no bus. The
         # callable is fail-safe and never raises into the inference loop.
         self._event_publisher: Optional[Callable[[Dict[str, Any]], None]] = None
+
+        # Optional central scheduler. Built lazily on first use so the default
+        # (disabled) deployment never constructs a worker pool at startup.
+        self._scheduler: Optional[InferenceScheduler] = None
+        self._scheduler_enabled = scheduler_enabled
+        self._scheduler_workers = scheduler_workers
+        self._scheduler_stream_queue_capacity = scheduler_stream_queue_capacity
+        self._scheduler_lock = threading.Lock()
+
+    def _get_scheduler(self) -> Optional[InferenceScheduler]:
+        """Return the lazy-built scheduler, or None when scheduling is disabled."""
+        if not self._scheduler_enabled:
+            return None
+        with self._scheduler_lock:
+            if self._scheduler is None:
+                self._scheduler = InferenceScheduler(
+                    self.Session,
+                    num_workers=self._scheduler_workers,
+                    stream_queue_capacity=self._scheduler_stream_queue_capacity,
+                )
+            return self._scheduler
 
     def set_event_publisher(
         self, publisher: Optional[Callable[[Dict[str, Any]], None]]
@@ -712,6 +846,7 @@ class InferenceService:
             config,
             self.Session,
             event_buffer=self.event_store.get_or_create(config.stream_id),
+            scheduler=self._get_scheduler(),
         )
         # Subscribe the derived-event publisher (Kafka bus) to this stream's
         # buffer. Guarded so a misbehaving publisher can never block a start.
@@ -780,6 +915,11 @@ class InferenceService:
                     f"Error stopping stream {stream_id} during shutdown",
                     stream_id=stream_id,
                 )
+
+        # Stop the shared worker pool (if it was ever built) after every stream's
+        # capture thread has been stopped, so no worker is processing a stream.
+        if self._scheduler is not None:
+            self._scheduler.stop()
 
         # Release the shutdown thread's session, then close all connections.
         self.Session.remove()

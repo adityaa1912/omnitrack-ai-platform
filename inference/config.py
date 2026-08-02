@@ -25,6 +25,11 @@ class DetectorConfig:
     # (ONNX Runtime CPUExecutionProvider). Selecting "onnx" exports the .pt
     # weights to a cached .onnx graph on first use and runs that instead.
     inference_provider: str = "torch"
+    # Auto mode only: benchmark available providers once and pick the fastest,
+    # caching results next to the model. Disabled by default so startup stays
+    # lazy (auto falls back to the fixed priority order).
+    benchmark_enabled: bool = False
+    benchmark_runs: int = 5
 
 
 @dataclass

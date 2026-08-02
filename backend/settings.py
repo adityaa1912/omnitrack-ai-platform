@@ -114,6 +114,21 @@ class Settings(BaseSettings):
     # accelerator providers export the .pt weights to a cached graph/engine on
     # first use. Optional and backwards compatible.
     inference_provider: Literal["torch", "onnx", "openvino", "tensorrt", "auto"] = "torch"
+    # Auto mode only: benchmark available providers once (results cached next to
+    # the model) and select the fastest. Disabled by default so startup stays
+    # lazy; enabling it trades a one-time benchmark for automatic selection.
+    inference_benchmark_enabled: bool = False
+    inference_benchmark_runs: int = Field(default=5, ge=1)
+
+    # Central inference scheduler (opt-in). Disabled by default: every stream
+    # runs its own inference thread exactly as before, and no worker pool is
+    # constructed (startup stays lazy). When enabled, capture and inference are
+    # decoupled through a shared, bounded worker pool (see backend/scheduler.py)
+    # so one slow stream cannot block others. Each stream is pinned to a single
+    # worker to preserve per-stream frame ordering and the per-thread DB session.
+    scheduler_enabled: bool = False
+    scheduler_workers: int = Field(default=2, ge=1)
+    scheduler_stream_queue_capacity: int = Field(default=2, ge=1)
     event_buffer_capacity: int = Field(default=1000, ge=1)
     event_ws_queue_capacity: int = Field(default=100, ge=1)
 

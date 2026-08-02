@@ -136,13 +136,20 @@ service = InferenceService(
     pool_pre_ping=settings.db_pool_pre_ping,
     connect_max_attempts=settings.db_connect_max_attempts,
     connect_retry_delay_seconds=settings.db_connect_retry_delay_seconds,
+    scheduler_enabled=settings.scheduler_enabled,
+    scheduler_workers=settings.scheduler_workers,
+    scheduler_stream_queue_capacity=settings.scheduler_stream_queue_capacity,
 )
 
 # Record the active inference provider as an info-style gauge and log it at
-# startup so the selected backend is visible in both /metrics and the logs.
+# startup so the selected backend is visible in both /metrics and the logs. In
+# auto mode the concrete provider is only known once a Detector is built (at
+# stream start, which sets the gauge then), so the startup label is skipped to
+# avoid asserting a backend that benchmarking/probing may not select.
 from .observability import metrics as _metrics
 
-_metrics.INFERENCE_PROVIDER.labels(provider=settings.inference_provider).set(1)
+if settings.inference_provider != "auto":
+    _metrics.INFERENCE_PROVIDER.labels(provider=settings.inference_provider).set(1)
 logger.info(
     "Inference provider selected: provider=%s model=%s device=%s",
     settings.inference_provider,
@@ -231,6 +238,8 @@ def _check_onnx_provider() -> CheckResult:
             inference_width=settings.inference_width,
             inference_height=settings.inference_height,
             inference_provider=settings.inference_provider,
+            benchmark_enabled=settings.inference_benchmark_enabled,
+            benchmark_runs=settings.inference_benchmark_runs,
         )
         provider = _build_provider(cfg)
         if not getattr(provider, "_auto_loaded", False):
@@ -244,6 +253,54 @@ def _check_onnx_provider() -> CheckResult:
                 name="onnx_provider", ok=True, detail=f"auto fallback ({exc})"
             )
         return CheckResult(name="onnx_provider", ok=False, detail=str(exc))
+
+
+def _check_benchmark() -> CheckResult:
+    """Readiness: expose provider-benchmark results without forcing a sweep.
+
+    Benchmarking is opt-in and lazy: this check never runs a benchmark. When
+    disabled it reports ``disabled`` (always ready). When enabled it reports any
+    cached per-provider results and the currently selected provider so the
+    selection is observable through the readiness system; the absence of a cache
+    is still ready (the sweep runs at first stream start).
+    """
+    if not settings.inference_benchmark_enabled:
+        return CheckResult(name="benchmark", ok=True, detail="disabled")
+    try:
+        from backend.inference import benchmark
+
+        cached = benchmark.cached_results(settings.model_path)
+        selected = benchmark.LAST_SELECTED or "pending"
+        detail = (
+            f"selected={selected} providers={sorted(cached)}"
+            if cached
+            else f"selected={selected} (not yet benchmarked)"
+        )
+        return CheckResult(name="benchmark", ok=True, detail=detail)
+    except Exception as exc:  # noqa: BLE001 - a failing check is data
+        return CheckResult(name="benchmark", ok=True, detail=f"unavailable ({exc})")
+
+
+def _check_scheduler() -> CheckResult:
+    """Readiness: report central-scheduler status.
+
+    When scheduling is disabled (the default) the check passes and reports
+    ``disabled`` so the backend is ready without a worker pool. When enabled it
+    reports the worker and live-stream counts; a pool that was built and then
+    stopped (service shut down) surfaces as not-ready.
+    """
+    if not settings.scheduler_enabled:
+        return CheckResult(name="scheduler", ok=True, detail="disabled")
+    scheduler = getattr(service, "_scheduler", None)
+    if scheduler is None:
+        return CheckResult(name="scheduler", ok=True, detail="pool not built (lazy)")
+    if scheduler._stopping:
+        return CheckResult(name="scheduler", ok=False, detail="stopped")
+    return CheckResult(
+        name="scheduler",
+        ok=True,
+        detail=f"workers={scheduler._num_workers} streams={len(scheduler._channels)}",
+    )
 
 
 def _check_stream_manager() -> CheckResult:
@@ -323,6 +380,8 @@ def _check_kafka() -> CheckResult:
 readiness_probe.register(_check_configuration)
 readiness_probe.register(_check_model_available)
 readiness_probe.register(_check_onnx_provider)
+readiness_probe.register(_check_benchmark)
+readiness_probe.register(_check_scheduler)
 readiness_probe.register(_check_stream_manager)
 readiness_probe.register(_check_database)
 readiness_probe.register(_check_redis)
@@ -737,6 +796,8 @@ async def start_stream(request: StartStreamRequest):
             enable_fp16=settings.enable_fp16,
             adaptive_frame_drop=settings.adaptive_frame_drop,
             inference_provider=settings.inference_provider,
+            inference_benchmark_enabled=settings.inference_benchmark_enabled,
+            inference_benchmark_runs=settings.inference_benchmark_runs,
             zones=zones,
             lines=lines,
             dwell_seconds=request.dwell_seconds,
