@@ -67,6 +67,19 @@ class Settings(BaseSettings):
     # specify one. Short-lived: cached reads are near-real-time projections.
     redis_default_ttl_seconds: int = Field(default=5, ge=1)
 
+    # Kafka event bus (optional). Disabled by default so local development and
+    # existing deployments run without Kafka; enable with
+    # ``OMNITRACK_KAFKA_ENABLED=true`` and set ``OMNITRACK_KAFKA_BOOTSTRAP_SERVERS``.
+    # Only derived inference events are published — never raw frames, images, or
+    # per-frame detections. When disabled or unreachable the backend runs
+    # normally — publishing is simply bypassed and never blocks inference.
+    kafka_enabled: bool = False
+    kafka_topic_events: str = Field(default="omnitrack.events", min_length=1)
+    # Producer send retries and the upper bound on delivery time before a
+    # produce call is failed (and dropped, by design) rather than blocking.
+    kafka_producer_retries: int = Field(default=3, ge=0)
+    kafka_delivery_timeout_seconds: float = Field(default=5.0, gt=0)
+
     model_path: str = Field(default="yolov8n.pt", min_length=1)
     inference_device: str = Field(default="cpu", min_length=1)
     inference_source_retry_attempts: int = Field(default=3, ge=1)
@@ -187,6 +200,18 @@ class Settings(BaseSettings):
         if not self.redis_enabled or self.redis_url is None:
             return None
         return str(self.redis_url)
+
+    @property
+    def resolved_kafka_bootstrap_servers(self) -> str | None:
+        """Return Kafka bootstrap servers when the event bus is enabled.
+
+        Returns ``None`` when ``kafka_enabled`` is false or no servers are
+        configured, so callers can treat "no servers" as "Kafka disabled"
+        without a separate flag check.
+        """
+        if not self.kafka_enabled or not self.kafka_bootstrap_servers:
+            return None
+        return self.kafka_bootstrap_servers
 
 
 @lru_cache(maxsize=1)

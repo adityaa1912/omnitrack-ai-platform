@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from .service import InferenceService, StreamConfig, StreamMetrics
 from .settings import get_settings
 from .cache import JsonCache, create_redis_client
+from .messaging import KafkaEventPublisher, create_kafka_producer
 from .observability import correlation
 from .observability import metrics as om
 from .observability.errors import log_error
@@ -152,6 +153,24 @@ redis_client = create_redis_client(
 cache = JsonCache(redis_client, default_ttl_seconds=settings.redis_default_ttl_seconds)
 
 # ---------------------------------------------------------------------------
+# Optional Kafka event bus. Disabled by default (``kafka_enabled=False``); when
+# enabled the producer connects lazily in the background so an unreachable
+# broker never blocks startup. Only derived events are published — never raw
+# frames, images, or per-frame detections — and publish failures never stop
+# inference.
+# ---------------------------------------------------------------------------
+
+kafka_producer = create_kafka_producer(
+    settings.resolved_kafka_bootstrap_servers,
+    retries=settings.kafka_producer_retries,
+    delivery_timeout_seconds=settings.kafka_delivery_timeout_seconds,
+)
+event_publisher = KafkaEventPublisher(kafka_producer, settings.kafka_topic_events)
+# Hand the publisher to the service so it can subscribe it to each stream's
+# event buffer at stream start. No-op when Kafka is disabled.
+service.set_event_publisher(event_publisher)
+
+# ---------------------------------------------------------------------------
 # Observability: readiness probe + background system sampler.
 # ---------------------------------------------------------------------------
 
@@ -236,11 +255,27 @@ def _check_redis() -> CheckResult:
     return CheckResult(name="redis", ok=False, detail="unreachable")
 
 
+def _check_kafka() -> CheckResult:
+    """Readiness: report Kafka event bus status.
+
+    When the event bus is disabled (the default) the check passes and reports
+    ``disabled`` so the backend is ready without Kafka. When enabled, a broker
+    metadata round-trip gates readiness so a configured-but-unreachable broker
+    surfaces as not-ready.
+    """
+    if kafka_producer is None:
+        return CheckResult(name="kafka", ok=True, detail="disabled")
+    if kafka_producer.ping():
+        return CheckResult(name="kafka", ok=True, detail="reachable")
+    return CheckResult(name="kafka", ok=False, detail="unreachable")
+
+
 readiness_probe.register(_check_configuration)
 readiness_probe.register(_check_model_available)
 readiness_probe.register(_check_stream_manager)
 readiness_probe.register(_check_database)
 readiness_probe.register(_check_redis)
+readiness_probe.register(_check_kafka)
 
 
 class StreamWebSocketManager:
@@ -315,6 +350,8 @@ async def lifespan(_app: FastAPI):
         await asyncio.to_thread(service.shutdown)
         if redis_client is not None:
             redis_client.close()
+        if kafka_producer is not None:
+            await asyncio.to_thread(kafka_producer.close)
         system_sampler.stop()
         shutdown_logging()
 

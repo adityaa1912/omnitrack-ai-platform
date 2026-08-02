@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable, Any
 from queue import Queue, Full
 import numpy as np
 
@@ -537,6 +537,23 @@ class InferenceService:
         # Bounded in-memory event history per stream (persists across stop).
         self.event_store = EventStore(capacity=event_capacity)
         self._is_shutdown = False
+        # Optional derived-event publisher (e.g. the Kafka event bus), subscribed
+        # to each stream's event buffer at stream start. ``None`` = no bus. The
+        # callable is fail-safe and never raises into the inference loop.
+        self._event_publisher: Optional[Callable[[Dict[str, Any]], None]] = None
+
+    def set_event_publisher(
+        self, publisher: Optional[Callable[[Dict[str, Any]], None]]
+    ) -> None:
+        """Register an optional derived-event publisher.
+
+        The publisher is subscribed to every stream's event buffer created from
+        this point on. Passing ``None`` (or a disabled publisher) leaves event
+        handling unchanged. This is the single seam between the in-process event
+        store and an external event bus; it does not alter EventBuffer semantics,
+        stream ownership, or inference logic.
+        """
+        self._event_publisher = publisher
 
     @staticmethod
     def _build_engine_with_retry(
@@ -596,6 +613,16 @@ class InferenceService:
             self.Session,
             event_buffer=self.event_store.get_or_create(config.stream_id),
         )
+        # Subscribe the derived-event publisher (Kafka bus) to this stream's
+        # buffer. Guarded so a misbehaving publisher can never block a start.
+        if self._event_publisher is not None:
+            try:
+                self.event_store.get(config.stream_id).subscribe(self._event_publisher)
+            except Exception as exc:  # noqa: BLE001 - bus must not affect streams
+                logger.warning(
+                    f"Could not subscribe event publisher for "
+                    f"{config.stream_id}: {exc}"
+                )
         stream.start()
         with self._streams_lock:
             self.streams[config.stream_id] = stream
