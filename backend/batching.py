@@ -135,15 +135,21 @@ class BatchCoordinator:
                     self._queue_cond.wait()
                 if not self._queue:
                     return  # stopping and drained
-                # Greedily grab up to max_size, capped by the wait deadline so
-                # stragglers do not delay an already-waiting batch.
+                # Take the first waiter, then linger up to max_wait_seconds for
+                # more concurrently-ready frames so a burst across streams fuses
+                # into one pass (bounded by max_size). Frames arriving past the
+                # deadline are left for the next drain. ``wait`` releases the
+                # lock so callers can keep enqueuing during the linger window.
                 batch = [self._queue.pop(0)]
                 deadline = time.perf_counter() + self.max_wait_seconds
-                while len(batch) < self.max_size and self._queue:
-                    if self._queue[0].slot.is_set():
-                        break  # a waiter aborted; leave it for the next drain
-                    if time.perf_counter() >= deadline:
-                        break
+                while len(batch) < self.max_size and not self._stopping:
+                    if not self._queue:
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break  # deadline elapsed; dispatch what we have
+                        self._queue_cond.wait(timeout=remaining)
+                        if not self._queue:
+                            break  # woke by deadline or stop with nothing new
                     batch.append(self._queue.pop(0))
             self._dispatch(batch)
 

@@ -214,8 +214,13 @@ class InferenceScheduler:
                     channel.in_flight = True
                     self._busy += 1
                     busy = self._busy
+                    # take_newest drained the queued backlog for this pickup, so
+                    # refresh the depth gauge here too; submit only reflects the
+                    # depth at enqueue and would otherwise read stale after a drain.
+                    depth = len(channel.pending)
                 frame, submit_ts = item
                 pickup_ts = time.perf_counter()
+                metrics.SCHEDULER_QUEUE_DEPTH.labels(stream_id=stream_id).set(depth)
                 metrics.SCHEDULER_WORKER_UTILIZATION.set(busy / self._num_workers)
                 metrics.SCHEDULER_LATENCY.labels(stream_id=stream_id).observe(
                     max(pickup_ts - submit_ts, 0.0)
