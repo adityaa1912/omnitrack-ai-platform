@@ -139,6 +139,16 @@ class Settings(BaseSettings):
     batching_enabled: bool = False
     batch_max_size: int = Field(default=8, ge=1)
     batch_max_wait_ms: int = Field(default=10, ge=0)
+
+    # Global model manager (opt-in). Disabled by default: streams either own a
+    # private detector or share one only through dynamic batching, exactly as
+    # before. When enabled, detectors are pooled in a process-wide manager that
+    # shares one model across identically-configured streams, reference-counts
+    # them, and evicts the least-recently-used idle model once the pool exceeds
+    # ``model_manager_max_loaded``. Provider selection, batching, and all
+    # REST/WebSocket/DB contracts are unchanged.
+    model_manager_enabled: bool = False
+    model_manager_max_loaded: int = Field(default=4, ge=1)
     event_buffer_capacity: int = Field(default=1000, ge=1)
     event_ws_queue_capacity: int = Field(default=100, ge=1)
 

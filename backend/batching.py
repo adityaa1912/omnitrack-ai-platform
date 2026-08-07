@@ -25,13 +25,16 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from inference.config import DetectorConfig
 from inference.detector import Detector
 from inference.types import Frame, InferenceResult
 from .observability import metrics
 from .observability.logging import get_logger
+
+if TYPE_CHECKING:
+    from .model_manager import ModelManager
 
 
 logger = get_logger(__name__, component="inference.batching")
@@ -195,12 +198,24 @@ class BatchManager:
     coordinator; ``release`` drops a stream's reference and stops the coordinator
     when the last reference goes away. ``stop_all`` shuts every coordinator down
     (used by the service at shutdown).
+
+    When a :class:`~backend.model_manager.ModelManager` is supplied, detector
+    ownership (load, reference counting, warm pooling and LRU eviction) is
+    delegated to it instead of built here, so batched and non-batched streams
+    share one process-wide model pool. Without one the manager builds and drops
+    detectors itself, exactly as before.
     """
 
-    def __init__(self, max_size: int, max_wait_ms: int) -> None:
+    def __init__(
+        self,
+        max_size: int,
+        max_wait_ms: int,
+        model_manager: "Optional[ModelManager]" = None,
+    ) -> None:
         self._max_size = max(max_size, 1)
         self._max_wait_seconds = max(max_wait_ms, 0) / 1000.0
         self._coordinator: Dict[str, BatchCoordinator] = {}
+        self._model_manager = model_manager
         self._lock = threading.Lock()
 
     def acquire(self, config: DetectorConfig) -> tuple[Detector, BatchCoordinator]:
@@ -209,13 +224,18 @@ class BatchManager:
         with self._lock:
             coordinator = self._coordinator.get(signature)
             if coordinator is None:
-                detector = Detector(config)
+                if self._model_manager is not None:
+                    detector = self._model_manager.acquire(config)
+                else:
+                    detector = Detector(config)
                 coordinator = BatchCoordinator(
                     detector, self._max_size, self._max_wait_seconds, signature
                 )
                 self._coordinator[signature] = coordinator
             else:
                 detector = coordinator.detector
+                if self._model_manager is not None:
+                    self._model_manager.acquire(config)
             coordinator.register()
             return detector, coordinator
 
@@ -223,12 +243,13 @@ class BatchManager:
         """Drop one stream's reference to the shared detector for ``signature``."""
         with self._lock:
             coordinator = self._coordinator.get(signature)
-            if coordinator is None:
-                return
-            coordinator.unregister()
-            if coordinator.stream_count == 0:
-                self._coordinator.pop(signature, None)
-                coordinator.stop()
+            if coordinator is not None:
+                coordinator.unregister()
+                if coordinator.stream_count == 0:
+                    self._coordinator.pop(signature, None)
+                    coordinator.stop()
+        if self._model_manager is not None:
+            self._model_manager.release(signature)
 
     def stop_all(self) -> None:
         """Stop every coordinator (service shutdown)."""

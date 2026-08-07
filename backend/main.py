@@ -142,6 +142,8 @@ service = InferenceService(
     batching_enabled=settings.batching_enabled,
     batch_max_size=settings.batch_max_size,
     batch_max_wait_ms=settings.batch_max_wait_ms,
+    model_manager_enabled=settings.model_manager_enabled,
+    model_manager_max_loaded=settings.model_manager_max_loaded,
 )
 
 # Record the active inference provider as an info-style gauge and log it at
@@ -326,6 +328,30 @@ def _check_batching() -> CheckResult:
     )
 
 
+def _check_model_manager() -> CheckResult:
+    """Readiness: report shared model-manager pool status.
+
+    When the model manager is disabled (the default) the check passes and
+    reports ``disabled``. When enabled it reports the resident and in-use model
+    counts against the configured cap; a pool not yet built (no stream started)
+    reports ``lazy`` and is still ready.
+    """
+    if not settings.model_manager_enabled:
+        return CheckResult(name="model_manager", ok=True, detail="disabled")
+    manager = getattr(service, "_model_manager", None)
+    if manager is None:
+        return CheckResult(name="model_manager", ok=True, detail="not built (lazy)")
+    stats = manager.stats()
+    return CheckResult(
+        name="model_manager",
+        ok=True,
+        detail=(
+            f"loaded={stats['loaded']} in_use={stats['in_use']} "
+            f"max={stats['max_loaded']}"
+        ),
+    )
+
+
 def _check_stream_manager() -> CheckResult:
     """Readiness: the stream manager must be constructed and not shut down."""
     if service is None:
@@ -406,6 +432,7 @@ readiness_probe.register(_check_onnx_provider)
 readiness_probe.register(_check_benchmark)
 readiness_probe.register(_check_scheduler)
 readiness_probe.register(_check_batching)
+readiness_probe.register(_check_model_manager)
 readiness_probe.register(_check_stream_manager)
 readiness_probe.register(_check_database)
 readiness_probe.register(_check_redis)

@@ -39,6 +39,7 @@ from .models import Detection as DetectionRecord, StreamSession, create_session_
 from .event_store import EventStore
 from .scheduler import InferenceScheduler
 from .batching import BatchManager, detector_signature
+from .model_manager import get_model_manager, shutdown_model_manager
 from .observability import correlation, metrics
 from .observability.errors import log_error
 from .observability.logging import get_logger
@@ -114,7 +115,7 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None) -> None:
+    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None, model_manager=None) -> None:
         self.config = config
         # Thread-safe session registry (scoped_session). Each thread that writes
         # obtains its OWN session via `self._session_factory()` and releases it
@@ -133,6 +134,10 @@ class InferenceStream:
         # None ==> this stream owns a private Detector and infers one frame at a
         # time, exactly as before.
         self._batch_manager = batch_manager
+        # Optional process-wide model pool. Used for the non-batched path to
+        # share (and reference-count) detectors across streams; the batched path
+        # shares through the batch manager, which delegates to this same pool.
+        self._model_manager = model_manager
         self._coordinator = None
         self._detector_signature = None
 
@@ -258,6 +263,12 @@ class InferenceStream:
             self.detector, self._coordinator = self._batch_manager.acquire(
                 detector_config
             )
+        elif self._model_manager is not None:
+            # Non-batched sharing: acquire the reference-counted shared detector
+            # from the process-wide pool. Inference stays one frame at a time
+            # (no coordinator), but the model is shared across identical streams.
+            self._detector_signature = detector_signature(detector_config)
+            self.detector = self._model_manager.acquire(detector_config)
         else:
             self.detector = Detector(detector_config)
         provider_name = getattr(self.detector.provider, "name", "unknown")
@@ -319,6 +330,12 @@ class InferenceStream:
             if self._batch_manager is not None and self._detector_signature is not None:
                 self._batch_manager.release(self._detector_signature)
             self._coordinator = None
+        elif self._model_manager is not None and self._detector_signature is not None:
+            # Non-batched shared detector: drop this stream's pool reference. The
+            # pool keeps the model warm (or evicts it under cap) — never null it
+            # here, as other streams of this signature may still hold it.
+            self._model_manager.release(self._detector_signature)
+            self.detector = None
         elif self.detector is not None:
             self.detector.model = None
 
@@ -768,6 +785,8 @@ class InferenceService:
         batching_enabled: bool = False,
         batch_max_size: int = 8,
         batch_max_wait_ms: int = 10,
+        model_manager_enabled: bool = False,
+        model_manager_max_loaded: int = 4,
     ) -> None:
         # Thread-safe DB access: one engine + a scoped_session registry shared by
         # every stream thread, each of which uses its own thread-local session.
@@ -811,6 +830,26 @@ class InferenceService:
         self._batch_max_wait_ms = batch_max_wait_ms
         self._batch_manager_lock = threading.Lock()
 
+        # Optional process-wide model manager. Built lazily on first use so the
+        # default (disabled) deployment never constructs a pool at startup. When
+        # enabled it backs both the batched path (via the batch manager) and the
+        # non-batched path with one reference-counted, LRU-bounded model pool.
+        self._model_manager = None
+        self._model_manager_enabled = model_manager_enabled
+        self._model_manager_max_loaded = model_manager_max_loaded
+        self._model_manager_lock = threading.Lock()
+
+    def _get_model_manager(self):
+        """Return the lazy-built model manager, or None when it is disabled."""
+        if not self._model_manager_enabled:
+            return None
+        with self._model_manager_lock:
+            if self._model_manager is None:
+                self._model_manager = get_model_manager(
+                    self._model_manager_max_loaded
+                )
+            return self._model_manager
+
     def _get_batch_manager(self) -> Optional[BatchManager]:
         """Return the lazy-built batch manager, or None when batching is disabled."""
         if not self._batching_enabled:
@@ -818,7 +857,9 @@ class InferenceService:
         with self._batch_manager_lock:
             if self._batch_manager is None:
                 self._batch_manager = BatchManager(
-                    self._batch_max_size, self._batch_max_wait_ms
+                    self._batch_max_size,
+                    self._batch_max_wait_ms,
+                    model_manager=self._get_model_manager(),
                 )
             return self._batch_manager
 
@@ -907,6 +948,7 @@ class InferenceService:
             event_buffer=self.event_store.get_or_create(config.stream_id),
             scheduler=self._get_scheduler(),
             batch_manager=self._get_batch_manager(),
+            model_manager=self._get_model_manager(),
         )
         # Subscribe the derived-event publisher (Kafka bus) to this stream's
         # buffer. Guarded so a misbehaving publisher can never block a start.
@@ -985,6 +1027,12 @@ class InferenceService:
         # streams have released their shared detectors.
         if self._batch_manager is not None:
             self._batch_manager.stop_all()
+
+        # Unload the shared model pool (if it was ever built) last, after every
+        # stream and coordinator has dropped its references, so the accelerator
+        # memory held by pooled detectors is reclaimed at shutdown.
+        if self._model_manager is not None:
+            shutdown_model_manager()
 
         # Release the shutdown thread's session, then close all connections.
         self.Session.remove()

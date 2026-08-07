@@ -258,6 +258,51 @@ BATCHING_EFFICIENCY = Gauge(
     registry=registry,
 )
 
+# ---------------------------------------------------------------------------
+# Model manager (process-wide shared detector pool: refcounting + LRU eviction)
+# ---------------------------------------------------------------------------
+
+# Detector models currently resident in the manager pool (loaded, warm or in
+# use). Bounded by the configured max-loaded cap except when every resident
+# model is in use, in which case the pool is allowed to exceed the cap rather
+# than evict a model a live stream still needs.
+MODEL_LOADED_MODELS = Gauge(
+    "omnitrack_model_loaded_models",
+    "Detector models currently resident in the model-manager pool.",
+    registry=registry,
+)
+
+# Acquisitions served by an already-resident shared model (no load).
+MODEL_CACHE_HITS_TOTAL = Counter(
+    "omnitrack_model_cache_hits_total",
+    "Detector acquisitions served by an already-loaded shared model.",
+    registry=registry,
+)
+
+# Acquisitions (or warm preloads) that had to load a new model.
+MODEL_CACHE_MISSES_TOTAL = Counter(
+    "omnitrack_model_cache_misses_total",
+    "Detector acquisitions that required loading a new model.",
+    registry=registry,
+)
+
+# Wall time to load a detector model into the pool (build + provider load +
+# warmup), off the per-frame path (paid once per signature on a cache miss).
+MODEL_LOAD_SECONDS = Histogram(
+    "omnitrack_model_load_seconds",
+    "Wall time to load a detector model into the manager pool.",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+    registry=registry,
+)
+
+# Wall time to unload/evict a detector model (LRU eviction or shutdown).
+MODEL_UNLOAD_SECONDS = Histogram(
+    "omnitrack_model_unload_seconds",
+    "Wall time to unload/evict a detector model from the manager pool.",
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
+    registry=registry,
+)
+
 # Per-stage latency within the inference pipeline. The ``stage`` label names
 # the pipeline stage (capture/preprocess/inference/tracking/event/render/
 # serialize) so a slow stage can be isolated from the end-to-end frame latency.
