@@ -149,6 +149,18 @@ class Settings(BaseSettings):
     # REST/WebSocket/DB contracts are unchanged.
     model_manager_enabled: bool = False
     model_manager_max_loaded: int = Field(default=4, ge=1)
+
+    # Global frame pool (opt-in). Disabled by default: every pipeline stage
+    # allocates its image buffers exactly as before, so behavior is unchanged.
+    # When enabled, a process-wide thread-safe pool recycles reusable image
+    # buffers (render output, letterbox canvas, resize destination, inference
+    # tensor) across frames to cut per-frame allocation and copy churn.
+    # ``frame_pool_initial_size`` spares are seeded on first use of each buffer
+    # shape and at most ``frame_pool_max_size`` buffers are retained overall.
+    # Buffer contents and all detector/tracker/render outputs are unchanged.
+    frame_pool_enabled: bool = False
+    frame_pool_initial_size: int = Field(default=4, ge=0)
+    frame_pool_max_size: int = Field(default=32, ge=1)
     event_buffer_capacity: int = Field(default=1000, ge=1)
     event_ws_queue_capacity: int = Field(default=100, ge=1)
 

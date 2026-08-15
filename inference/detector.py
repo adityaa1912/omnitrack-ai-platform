@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 
 from .config import DetectorConfig
+from .frame_pool import get_frame_pool
 from .types import Detection, Frame, InferenceResult
 
 
@@ -169,6 +170,9 @@ class Detector:
 
         raw = self._predict_with_fallback(data)
 
+        if data is not frame.data:
+            get_frame_pool().release(data)
+
         inference_time_ms = (time.time() - start_time) * 1000
 
         detections = self._parse_results(raw)
@@ -193,7 +197,9 @@ class Detector:
         if iw > 0 and ih > 0 and (data.shape[1] != iw or data.shape[0] != ih):
             import cv2
 
-            return cv2.resize(data, (iw, ih), interpolation=cv2.INTER_LINEAR)
+            dst = get_frame_pool().acquire((ih, iw) + data.shape[2:], data.dtype)
+            cv2.resize(data, (iw, ih), dst=dst, interpolation=cv2.INTER_LINEAR)
+            return dst
         return data
 
     def predict_batch(self, frames: list[Frame]) -> list[InferenceResult]:
@@ -210,6 +216,10 @@ class Detector:
         start_time = time.time()
         batch = [self._resize_for_inference(f.data) for f in frames]
         raws = self.provider.predict_batch(batch)
+        pool = get_frame_pool()
+        for original, resized in zip(frames, batch):
+            if resized is not original.data:
+                pool.release(resized)
         per_frame_ms = ((time.time() - start_time) * 1000) / len(frames)
         results = []
         for frame, raw in zip(frames, raws):

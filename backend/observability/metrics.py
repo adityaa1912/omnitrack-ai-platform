@@ -31,6 +31,7 @@ from prometheus_client import (
     REGISTRY,
     generate_latest,
 )
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 # Use the default global registry so the exposition endpoint and any future
 # custom collectors share one view of the world.
@@ -405,6 +406,59 @@ BUILD_INFO = Gauge(
     labelnames=("version", "environment"),
     registry=registry,
 )
+
+
+# ---------------------------------------------------------------------------
+# Frame pool (process-wide reusable image-buffer pool)
+# ---------------------------------------------------------------------------
+
+class _FramePoolCollector:
+    """Bridge the dependency-free ``inference`` frame pool into Prometheus.
+
+    The pool lives in the ``inference`` package and takes no observability
+    dependency; this custom collector reads its counters at scrape time so the
+    six frame-pool series are exposed through the same registry as everything
+    else. When the pool is disabled the counters stay flat (all acquisitions
+    miss and nothing is retained).
+    """
+
+    def collect(self):
+        from inference.frame_pool import get_frame_pool
+
+        stats = get_frame_pool().stats()
+        yield GaugeMetricFamily(
+            "omnitrack_frame_pool_size",
+            "Reusable image buffers currently retained in the frame pool.",
+            value=stats["size"],
+        )
+        yield GaugeMetricFamily(
+            "omnitrack_buffer_reuse_ratio",
+            "Fraction of buffer acquisitions served from the pool (0-1).",
+            value=stats["reuse_ratio"],
+        )
+        yield CounterMetricFamily(
+            "omnitrack_frame_pool_hits",
+            "Buffer acquisitions served by a reused pooled buffer.",
+            value=stats["hits"],
+        )
+        yield CounterMetricFamily(
+            "omnitrack_frame_pool_misses",
+            "Buffer acquisitions that allocated a new buffer.",
+            value=stats["misses"],
+        )
+        yield CounterMetricFamily(
+            "omnitrack_frame_allocations",
+            "Image buffers allocated by the frame pool.",
+            value=stats["allocations"],
+        )
+        yield CounterMetricFamily(
+            "omnitrack_copy_operations",
+            "Image-buffer copy operations performed via the frame pool.",
+            value=stats["copies"],
+        )
+
+
+registry.register(_FramePoolCollector())
 
 
 # ---------------------------------------------------------------------------

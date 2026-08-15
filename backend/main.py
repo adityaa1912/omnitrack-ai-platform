@@ -33,6 +33,11 @@ from .observability.logging import configure_logging, get_logger, shutdown_loggi
 from .observability.readiness import CheckResult, ReadinessProbe, SystemSampler
 from inference.types import Detection as InferenceDetection
 from inference.events.regions import Zone, CrossingLine
+from inference.frame_pool import (
+    configure_frame_pool,
+    get_frame_pool,
+    shutdown_frame_pool,
+)
 
 
 # Configure structured JSON logging before anything else logs, so every record
@@ -498,6 +503,11 @@ async def lifespan(_app: FastAPI):
     om.BUILD_INFO.labels(
         version=app.version, environment=settings.environment
     ).set(1)
+    configure_frame_pool(
+        enabled=settings.frame_pool_enabled,
+        initial_size=settings.frame_pool_initial_size,
+        max_size=settings.frame_pool_max_size,
+    )
     system_sampler.start()
     logger.info(
         "Application startup: observability initialized",
@@ -509,6 +519,7 @@ async def lifespan(_app: FastAPI):
         logger.info("Application shutdown: stopping streams and disposing resources")
         stream_websockets.close_all()
         await asyncio.to_thread(service.shutdown)
+        shutdown_frame_pool()
         if redis_client is not None:
             redis_client.close()
         if kafka_producer is not None:
@@ -1124,6 +1135,7 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
             _, buffer = cv2.imencode(
                 ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
             )
+            get_frame_pool().release(frame)
             frame_base64 = base64.b64encode(buffer).decode("utf-8")
             await websocket.send_json({
                 "type": "frame",

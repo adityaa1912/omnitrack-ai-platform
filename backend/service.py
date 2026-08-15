@@ -33,6 +33,7 @@ from inference.config import (
 )
 from inference.tracking_config import TrackingConfig
 from inference.types import Detection, Frame
+from inference.frame_pool import get_frame_pool
 from inference.events import EventEngine, EventEngineConfig
 from inference.events.regions import CrossingLine, Zone
 from .models import Detection as DetectionRecord, StreamSession, create_session_factory
@@ -580,7 +581,8 @@ class InferenceStream:
         except Full:
             if cfg.adaptive_frame_drop:
                 try:
-                    self.output_queue.get_nowait()  # evict stalest
+                    evicted = self.output_queue.get_nowait()  # evict stalest
+                    get_frame_pool().release(evicted.get("frame"))
                     self.output_queue.put_nowait({
                         "frame": output_frame,
                         "detections": result.detections,
@@ -592,6 +594,7 @@ class InferenceStream:
             if not enqueued:
                 # Counted, not silent: a slow consumer never
                 # back-pressures the inference loop.
+                get_frame_pool().release(output_frame)
                 metrics.DROPPED_FRAMES_TOTAL.labels(
                     stream_id=self.config.stream_id
                 ).inc()

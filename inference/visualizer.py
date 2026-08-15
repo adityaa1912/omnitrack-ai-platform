@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from .config import VisualizerConfig
+from .frame_pool import get_frame_pool
 from .types import Detection, InferenceResult
 from .tracking_types import TrackedObject, TrackingResult
 
@@ -93,7 +94,7 @@ class Visualizer:
         Returns:
             Frame with bounding boxes, labels, and FPS counter
         """
-        output = frame.copy()
+        output = get_frame_pool().copy_of(frame)
 
         for detection in result.detections:
             self._draw_detection(output, detection)
@@ -231,7 +232,7 @@ class Visualizer:
         Returns:
             Frame with tracked objects, IDs, trajectories, and FPS counter
         """
-        output = frame.copy()
+        output = get_frame_pool().copy_of(frame)
 
         # Draw trajectories first (background)
         if self.config.show_trajectories:

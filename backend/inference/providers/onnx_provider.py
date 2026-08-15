@@ -22,6 +22,7 @@ from typing import List, Optional
 import numpy as np
 
 from inference.config import DetectorConfig
+from inference.frame_pool import get_frame_pool
 
 from .base import InferenceProvider, RawDetection
 
@@ -136,23 +137,31 @@ class ONNXProvider(InferenceProvider):
         """
         import cv2
 
+        pool = get_frame_pool()
         h0, w0 = data.shape[:2]
         size = self._input_size
         scale = min(size / w0, size / h0)
         nw, nh = int(round(w0 * scale)), int(round(h0 * scale))
-        resized = cv2.resize(data, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((size, size, 3), 114, dtype=np.uint8)
         pad_x, pad_y = (size - nw) // 2, (size - nh) // 2
+        canvas = pool.acquire((size, size, 3), np.uint8)
+        canvas.fill(114)
+        resized = pool.acquire((nh, nw, 3), data.dtype)
+        cv2.resize(data, (nw, nh), dst=resized, interpolation=cv2.INTER_LINEAR)
         canvas[pad_y : pad_y + nh, pad_x : pad_x + nw] = resized
-        tensor = canvas[:, :, ::-1].transpose(2, 0, 1)  # BGR→RGB, HWC→CHW
-        tensor = np.ascontiguousarray(tensor, dtype=np.float32) / 255.0
-        return tensor[None], scale, (pad_x, pad_y)
+        pool.release(resized)
+        tensor = pool.acquire((1, 3, size, size), np.float32)
+        chw = canvas[:, :, ::-1].transpose(2, 0, 1)  # BGR→RGB, HWC→CHW
+        np.copyto(tensor[0], chw)
+        tensor[0] /= 255.0
+        pool.release(canvas)
+        return tensor, scale, (pad_x, pad_y)
 
     def predict(self, data: np.ndarray) -> List[RawDetection]:
         if self.session is None:
             raise RuntimeError("ONNXProvider session not loaded.")
         tensor, scale, (pad_x, pad_y) = self._preprocess(data)
         outputs = self.session.run(None, {self._input_name: tensor})
+        get_frame_pool().release(tensor)
         return self._postprocess(outputs[0], scale, pad_x, pad_y)
 
     def _postprocess(
