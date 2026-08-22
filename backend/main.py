@@ -610,6 +610,22 @@ configure_get_db(lambda: service.Session())
 
 app.include_router(auth_router.router)
 
+# ============================================================================
+# Recording router integration
+# ============================================================================
+
+from backend.recording import api as recording_router
+from backend.recording.manager import RecordingManager
+from backend.recording.storage import LocalFileStorageProvider
+
+if getattr(settings, "recording_enabled", False) and getattr(settings, "recording_storage_path", None):
+    recording_storage = LocalFileStorageProvider(settings.recording_storage_path)
+    recording_manager = RecordingManager(service.Session, recording_storage, settings)
+    recording_router.set_manager(recording_manager)
+    logger.info(f"Recording manager initialized at {settings.recording_storage_path}")
+
+app.include_router(recording_router.router)
+
 
 @app.middleware("http")
 async def _api_key_middleware(request: Request, call_next):

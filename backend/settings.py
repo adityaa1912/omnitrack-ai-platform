@@ -164,6 +164,20 @@ class Settings(BaseSettings):
     event_buffer_capacity: int = Field(default=1000, ge=1)
     event_ws_queue_capacity: int = Field(default=100, ge=1)
 
+    # Recording & Evidence. Disabled when storage_path is None. Pre/post
+    # buffering is in-memory only; segments rotate when the max-duration cap
+    # is reached. Retention and storage-cap enforcement run in a background
+    # thread (never on the inference or ASGI path).
+    recording_enabled: bool = False
+    recording_storage_path: str | None = None
+    recording_max_segment_seconds: int = Field(default=60, ge=1)
+    recording_pre_buffer_frames: int = Field(default=30, ge=0)
+    recording_post_buffer_duration_seconds: float = Field(default=5.0, gt=0)
+    recording_retention_hours: int = Field(default=24, ge=1)
+    recording_retention_cleanup_interval_seconds: int = Field(default=300, ge=60)
+    recording_storage_max_bytes: int | None = Field(None, ge=1)
+    recording_segment_rotation_interval_seconds: int = Field(default=300, ge=60)
+
     logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     cors_origins: str = "*"
     api_key: str | None = None

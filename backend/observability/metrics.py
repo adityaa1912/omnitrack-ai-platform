@@ -462,6 +462,92 @@ registry.register(_FramePoolCollector())
 
 
 # ---------------------------------------------------------------------------
+# Recording & Evidence Pipeline
+# ---------------------------------------------------------------------------
+
+RECORDINGS_STARTED_TOTAL = Counter(
+    "omnitrack_recordings_started_total",
+    "Total recording segments started, by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+RECORDINGS_STOPPED_TOTAL = Counter(
+    "omnitrack_recordings_stopped_total",
+    "Total recording segments stopped, by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+RECORDINGS_DELETED_TOTAL = Counter(
+    "omnitrack_recordings_deleted_total",
+    "Total recording segments deleted (retention/storage-max/manual).",
+    registry=registry,
+)
+
+RECORDINGS_LISTED_TOTAL = Counter(
+    "omnitrack_recordings_listed_total",
+    "Total recordings returned by list endpoints.",
+    registry=registry,
+)
+
+EVIDENCES_CREATED_TOTAL = Counter(
+    "omnitrack_evidences_created_total",
+    "Total evidence clips created, by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+ENCODING_FAILURES_TOTAL = Counter(
+    "omnitrack_encoding_failures_total",
+    "Total event-clip encoding failures, by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+DROPPED_RECORDING_FRAMES_TOTAL = Counter(
+    "omnitrack_dropped_recording_frames_total",
+    "Total frames dropped by the recording pipeline (queue full), by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+API_REQUEST_ERRORS_TOTAL = Counter(
+    "omnitrack_api_request_errors_total",
+    "Total internal errors in API handlers (recordings/evidences).",
+    registry=registry,
+)
+
+RECORDING_FPS = Gauge(
+    "omnitrack_recording_fps",
+    "Effective recording throughput (frames/sec), by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+ENCODER_LATENCY = Histogram(
+    "omnitrack_encoder_latency_seconds",
+    "Event-clip encoder wall time in seconds, by stream.",
+    labelnames=("stream_id",),
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+    registry=registry,
+)
+
+SEGMENT_COUNT = Gauge(
+    "omnitrack_segment_count",
+    "Current number of recording segments, by stream.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
+STORAGE_USAGE_BYTES = Gauge(
+    "omnitrack_storage_usage_bytes",
+    "Current recording storage usage in bytes.",
+    registry=registry,
+)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

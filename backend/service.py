@@ -151,6 +151,7 @@ class InferenceStream:
 
         # Bounded in-memory event sink (ring buffer owned by the service).
         self.event_buffer = event_buffer
+        self.recording_manager = None
 
         # State
         self.is_running = False
@@ -174,6 +175,13 @@ class InferenceStream:
         try:
             self._initialize_components()
             self.is_running = True
+            # Initialize recording manager if enabled
+            if getattr(settings, "recording_enabled", False) and getattr(settings, "recording_storage_path", None):
+                from backend.recording.manager import RecordingManager
+                from backend.recording.storage import LocalFileStorageProvider
+                storage = LocalFileStorageProvider(settings.recording_storage_path)
+                self.recording_manager = RecordingManager(self._session_factory, storage, settings)
+                self.recording_manager.start_recording(self.config.stream_id)
             if self._scheduler is not None:
                 # Decoupled path: pin this stream to a scheduler worker and run a
                 # capture-only thread that submits frames for that worker to
@@ -230,6 +238,11 @@ class InferenceStream:
             return
 
         self.is_running = False
+        if self.recording_manager:
+            try:
+                self.recording_manager.stop_recording(self.config.stream_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Error stopping recording manager for {self.config.stream_id}: {exc}")
         if self.thread is not None:
             self.thread.join(timeout=self.config.stop_timeout_seconds)
         # In scheduler mode the capture thread's `finally` already runs
@@ -599,6 +612,21 @@ class InferenceStream:
                     stream_id=self.config.stream_id
                 ).inc()
 
+        # Push frame to recording manager (fail-safe, off the hot path).
+        if self.recording_manager:
+            try:
+                self.recording_manager.push_frame(
+                    self.config.stream_id,
+                    {
+                        "image": output_frame,
+                        "width": getattr(self.config, "width", 640),
+                        "height": getattr(self.config, "height", 480),
+                        "fps": self.metrics.fps,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Error pushing frame to recording manager: {exc}")
+
         # Record per-frame pipeline metrics (queue depth sampled
         # after the put/drop so it reflects the current state).
         frame_latency_ms = (time.perf_counter() - frame_start) * 1000.0
@@ -681,6 +709,16 @@ class InferenceStream:
                         event_type=str(record.get("event_type", "unknown")),
                         severity=str(record.get("severity", "unknown")),
                     ).inc()
+                    # Trigger recording manager for this event type
+                    if self.recording_manager:
+                        try:
+                            self.recording_manager.trigger_event(
+                                self.config.stream_id,
+                                str(record.get("event_type", "unknown")),
+                                record,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error(f"Error triggering recording event: {exc}")
         except Exception as exc:
             # Contained deliberately: event derivation must never kill the
             # inference loop. Logged structured with traceback, not swallowed.
