@@ -16,12 +16,15 @@ from sqlalchemy import (
     DateTime,
     Boolean,
     JSON,
+    Text,
+    ForeignKey,
+    Index,
     create_engine,
     event,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.orm import scoped_session, sessionmaker, relationship
 
 Base = declarative_base()
 
@@ -94,6 +97,93 @@ class StreamSession(Base):
     # Status
     is_active = Column(Boolean, default=True, index=True)
     error_message = Column(String, nullable=True)
+
+
+class User(Base):
+    """User accounts for authentication and authorization."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(255), unique=True, nullable=False, index=True)
+    email = Column(String(255), unique=True, nullable=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(50), nullable=False, default="viewer", index=True)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    last_login_at = Column(DateTime, nullable=True)
+
+    api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
+    audit_logs = relationship("AuditLog", back_populates="user")
+
+    __table_args__ = (
+        Index("ix_users_role_is_active", "role", "is_active"),
+    )
+
+
+class APIKey(Base):
+    """API keys for programmatic access."""
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    key_hash = Column(String(255), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="api_keys")
+
+    __table_args__ = (
+        Index("ix_api_keys_user_active", "user_id", "is_active"),
+    )
+
+
+class AuditLog(Base):
+    """Audit trail for security-relevant actions."""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    username = Column(String(255), nullable=True)
+    action = Column(String(255), nullable=False, index=True)
+    resource_type = Column(String(100), nullable=True, index=True)
+    resource_id = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=False, index=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    user = relationship("User", back_populates="audit_logs")
+
+    __table_args__ = (
+        Index("ix_audit_logs_user_action", "user_id", "action"),
+        Index("ix_audit_logs_resource", "resource_type", "resource_id"),
+        Index("ix_audit_logs_created_status", "created_at", "status"),
+    )
+
+
+class Session(Base):
+    """Active user sessions for token revocation and session management."""
+    __tablename__ = "sessions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_jti = Column(String(255), unique=True, nullable=False, index=True)
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    last_activity_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_sessions_user_active", "user_id", "is_active"),
+        Index("ix_sessions_expires", "expires_at", "is_active"),
+    )
 
 
 def create_session_factory(

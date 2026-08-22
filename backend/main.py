@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, List, Tuple
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query, Request
+from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.websockets import WebSocketState
@@ -39,13 +39,14 @@ from inference.frame_pool import (
     shutdown_frame_pool,
 )
 
-
-# Configure structured JSON logging before anything else logs, so every record
-# (including uvicorn's) is emitted as JSON. Idempotent.
 settings = get_settings()
 configure_logging(settings.logging_level)
 
 logger = get_logger(__name__, component="backend.api")
+
+_auth_enabled = bool(getattr(settings, "jwt_secret", None))
+
+from backend.auth.dependencies import get_current_user, get_current_user_optional, require_role, CurrentUser
 
 
 def _to_native(value):
@@ -86,7 +87,10 @@ def _cors_config() -> tuple[list[str], bool]:
 API_KEY = (settings.api_key or "").strip() or None
 
 # Paths that never require a key (health checks, docs, service root).
-_AUTH_EXEMPT_PATHS = frozenset({"/health", "/", "/docs", "/redoc", "/openapi.json"})
+_AUTH_EXEMPT_PATHS = frozenset({
+    "/health", "/", "/docs", "/redoc", "/openapi.json",
+    "/auth/login", "/auth/register", "/auth/refresh",
+})
 
 
 def _check_api_key(provided: Optional[str]) -> bool:
@@ -536,6 +540,47 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ---------------------------------------------------------------------------
+# OpenAPI security scheme definitions
+# ---------------------------------------------------------------------------
+from fastapi.security import HTTPBearer, APIKeyHeader
+
+bearer_scheme = HTTPBearer(auto_error=False)
+api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def custom_openapi():
+    """Add JWT Bearer and API Key security schemes to the OpenAPI schema.
+
+    Applies the schemes to all endpoints that require authentication (stream
+    control and user management). The actual authentication logic remains
+    unchanged – this only enriches the generated OpenAPI documentation.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = app.openapi()
+    # Define security schemes
+    openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {"type": "http", "scheme": "bearer"},
+        "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+    }
+    # Apply to relevant paths – stream endpoints and auth management routes
+    for path, methods in openapi_schema["paths"].items():
+        # Skip public auth routes that are intentionally unauthenticated
+        if path.startswith("/auth/login") or path.startswith("/auth/register") or path.startswith("/auth/refresh"):
+            continue
+        # Apply to all other /auth/* and /stream/* endpoints
+        if path.startswith("/auth") or path.startswith("/stream"):
+            for operation in methods.values():
+                operation.setdefault("security", []).append({"BearerAuth": []})
+                operation["security"].append({"ApiKeyAuth": []})
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
+
 # Enable CORS for frontend integration. Origins are configurable via
 # OMNITRACK_CORS_ORIGINS (comma-separated); defaults to '*' for local dev.
 _cors_origins, _cors_allow_credentials = _cors_config()
@@ -546,6 +591,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================================
+# Database session dependency for FastAPI (handled by auth dependencies)
+# ============================================================================
+
+
+# ============================================================================
+# Auth router integration
+# ============================================================================
+
+from backend.auth import router as auth_router
+from backend.auth.dependencies import configure_get_db, get_current_user_optional, require_role
+
+# Configure the auth dependency to use the service's scoped_session
+configure_get_db(lambda: service.Session())
+
+app.include_router(auth_router.router)
 
 
 @app.middleware("http")
@@ -820,7 +883,10 @@ async def prometheus_metrics():
 
 
 @app.post("/stream/start", response_model=MetricsResponse)
-async def start_stream(request: StartStreamRequest):
+async def start_stream(
+    request: StartStreamRequest,
+    user: CurrentUser = Depends(require_role("operator")) if _auth_enabled else None,
+):
     """Start a new inference stream."""
     # Translate scene-region specs into inference geometry up front, so invalid
     # geometry is rejected (422) before any stream resource is opened. This
@@ -882,7 +948,10 @@ async def start_stream(request: StartStreamRequest):
 
 
 @app.post("/stream/stop")
-async def stop_stream(stream_id: str):
+async def stop_stream(
+    stream_id: str,
+    user: CurrentUser = Depends(require_role("operator")) if _auth_enabled else None,
+):
     """Stop an inference stream."""
     try:
         # Wake every handler first.  Each handler owns and sends its own close
@@ -901,7 +970,10 @@ async def stop_stream(stream_id: str):
 
 
 @app.get("/stream/{stream_id}/metrics", response_model=MetricsResponse)
-async def get_metrics(stream_id: str):
+async def get_metrics(
+    stream_id: str,
+    user: CurrentUser = Depends(require_role("viewer")) if _auth_enabled else None,
+):
     """Get metrics for a specific stream."""
     cache_key = f"stream:{stream_id}:metrics"
     cached = cache.get(cache_key)
@@ -928,7 +1000,10 @@ async def get_metrics(stream_id: str):
 
 
 @app.get("/stream/{stream_id}/detections", response_model=List[DetectionResponse])
-async def get_detections(stream_id: str):
+async def get_detections(
+    stream_id: str,
+    user: CurrentUser = Depends(require_role("viewer")) if _auth_enabled else None,
+):
     """Get latest detections from a stream."""
     cache_key = f"stream:{stream_id}:detections"
     cached = cache.get(cache_key)
@@ -965,6 +1040,7 @@ async def get_detections(stream_id: str):
 @app.get("/stream/{stream_id}/events", response_model=List[EventResponse])
 async def get_events(
     stream_id: str,
+    user: CurrentUser = Depends(require_role("viewer")) if _auth_enabled else None,
     limit: int = Query(
         default=DEFAULT_EVENT_LIMIT,
         ge=1,
@@ -984,7 +1060,10 @@ async def get_events(
 
 
 @app.get("/stream/{stream_id}/regions", response_model=RegionsResponse)
-async def get_regions(stream_id: str):
+async def get_regions(
+    stream_id: str,
+    user: CurrentUser = Depends(require_role("viewer")) if _auth_enabled else None,
+):
     """Return the scene-region geometry configured on a stream (zones/lines).
 
     404 if the stream is not active. Regions are fixed at stream start, so this
@@ -997,7 +1076,11 @@ async def get_regions(stream_id: str):
 
 
 @app.put("/stream/{stream_id}/regions", response_model=RegionsResponse)
-async def update_regions(stream_id: str, request: RegionsUpdateRequest):
+async def update_regions(
+    stream_id: str,
+    request: RegionsUpdateRequest,
+    user: CurrentUser = Depends(require_role("operator")) if _auth_enabled else None,
+):
     """Replace a running stream's scene regions live — no restart.
 
     Rebuilds the event engine's geometry detectors in place (existing tracks are
@@ -1022,7 +1105,9 @@ async def update_regions(stream_id: str, request: RegionsUpdateRequest):
 
 
 @app.get("/streams", response_model=List[StreamResponse])
-async def list_streams():
+async def list_streams(
+    user: CurrentUser = Depends(require_role("viewer")) if _auth_enabled else None,
+):
     """List all active streams."""
     streams = service.list_streams()
 
@@ -1049,6 +1134,35 @@ async def list_streams():
 # WebSocket Endpoint for Real-time Frame Streaming
 # ============================================================================
 
+async def _authenticate_websocket(websocket: WebSocket) -> Optional[CurrentUser]:
+    """Authenticate WebSocket connection via JWT token or API key.
+
+    Returns CurrentUser if authenticated, None if auth is disabled.
+    Raises HTTPException on invalid credentials.
+    """
+    if not _auth_enabled:
+        return None
+
+    token = websocket.query_params.get("token")
+    api_key = websocket.query_params.get("api_key")
+
+    if token:
+        from backend.auth.dependencies import get_current_user
+        try:
+            return await get_current_user(token=token, db=service.Session())
+        except Exception:
+            return None
+
+    if api_key:
+        from backend.auth.dependencies import get_api_key_user
+        try:
+            return await get_api_key_user(api_key=api_key, db=service.Session())
+        except Exception:
+            return None
+
+    return None
+
+
 @app.websocket("/stream/{stream_id}/ws")
 async def websocket_stream(websocket: WebSocket, stream_id: str):
     """
@@ -1057,8 +1171,13 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
     Sends JPEG-encoded frames as binary data with detection overlays.
     Client can subscribe to a stream and receive frames in real-time.
     """
-    if not _check_api_key(websocket.query_params.get("api_key")):
-        await websocket.close(code=1008)  # policy violation
+    if _auth_enabled:
+        user = await _authenticate_websocket(websocket)
+        if user is None:
+            await websocket.close(code=1008)
+            return
+    elif not _check_api_key(websocket.query_params.get("api_key")):
+        await websocket.close(code=1008)
         return
 
     await websocket.accept()
@@ -1211,8 +1330,13 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
       - The subscription is always torn down on disconnect (the `finally`), so a
         departed client leaves no callback registered on the buffer.
     """
-    if not _check_api_key(websocket.query_params.get("api_key")):
-        await websocket.close(code=1008)  # policy violation
+    if _auth_enabled:
+        user = await _authenticate_websocket(websocket)
+        if user is None:
+            await websocket.close(code=1008)
+            return
+    elif not _check_api_key(websocket.query_params.get("api_key")):
+        await websocket.close(code=1008)
         return
 
     await websocket.accept()

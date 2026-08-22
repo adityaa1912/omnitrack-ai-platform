@@ -168,6 +168,22 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     api_key: str | None = None
 
+    # Authentication & Authorization. JWT secret is REQUIRED in production;
+    # a missing/empty secret disables JWT auth (local dev only). API keys
+    # remain supported independently for backwards compatibility.
+    jwt_secret: str | None = None
+    jwt_algorithm: str = Field(default="HS256", min_length=1)
+    jwt_access_token_expire_minutes: int = Field(default=60, ge=1)
+    jwt_refresh_token_expire_days: int = Field(default=7, ge=1)
+    # Password hashing iterations (PBKDF2-SHA256). Higher = more secure but slower.
+    password_hash_iterations: int = Field(default=100000, ge=10000)
+    # Rate limiting for auth endpoints (login, token refresh). Limits requests
+    # per IP per minute to mitigate brute-force attacks. 0 = unlimited (disabled).
+    auth_rate_limit_per_minute: int = Field(default=10, ge=0)
+    # Session management: track active tokens for revocation. When disabled, tokens
+    # remain valid until expiry regardless of logout/revoke calls (stateless JWT).
+    session_management_enabled: bool = False
+
     # Observability. Metrics are always exposed at /metrics (Prometheus text
     # format); the system sampler interval controls how often process CPU /
     # memory / thread gauges are refreshed off the request path.
