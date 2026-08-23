@@ -204,6 +204,101 @@ event_publisher = KafkaEventPublisher(kafka_producer, settings.kafka_topic_event
 service.set_event_publisher(event_publisher)
 
 # ---------------------------------------------------------------------------
+# Optional analytics engine. Disabled by default (``analytics_enabled=False``);
+# when enabled it consumes derived events via the existing EventBuffer
+# subscription, maintains in-memory counters, flushes periodic PostgreSQL
+# summaries, and publishes snapshots to Kafka. All of it degrades gracefully:
+# analytics is wired through the same guarded subscription path as the Kafka
+# publisher, so it can never block a stream start or stall inference.
+# ---------------------------------------------------------------------------
+
+analytics_aggregator = None
+if getattr(settings, "analytics_enabled", False):
+    from backend.analytics.aggregator import AnalyticsAggregator
+    from backend.analytics.publisher import AnalyticsEventPublisher
+
+    analytics_aggregator = AnalyticsAggregator(
+        service.Session,
+        aggregation_window_seconds=settings.analytics_aggregation_window_seconds,
+        retention_hours=settings.analytics_retention_hours,
+    )
+    analytics_aggregator.start()
+    service.set_analytics(analytics_aggregator)
+    analytics_event_publisher = AnalyticsEventPublisher(
+        event_publisher, settings.analytics_kafka_topic
+    )
+    logger.info("Analytics engine initialized")
+
+# ---------------------------------------------------------------------------
+# Optional alert & rule engine. Disabled by default (alert_engine_enabled).
+# Consumes derived events via the existing EventBuffer subscription, evaluates
+# configurable rules, and drives the alert lifecycle. All of it degrades
+# gracefully: evaluation and notification run on background threads and are
+# wired through the same guarded subscription path as analytics, so it can
+# never block a stream start or stall inference.
+# ---------------------------------------------------------------------------
+
+alert_engine = None
+alert_manager = None
+alert_broadcaster = None
+alert_inapp_provider = None
+if getattr(settings, "alert_engine_enabled", False):
+    from backend.alerts.state import AlertStateStore
+    from backend.alerts.notifications import (
+        InAppNotificationProvider,
+        NotificationDispatcher,
+        WebhookNotificationProvider,
+    )
+    from backend.alerts.publisher import AlertEventPublisher
+    from backend.alerts.manager import AlertManager
+    from backend.alerts.engine import AlertRuleEngine
+    from backend.alerts.broadcast import AlertBroadcaster
+
+    alert_broadcaster = AlertBroadcaster()
+    alert_state_store = AlertStateStore(
+        cache, dedup_window_seconds=settings.alert_dedup_window_seconds
+    )
+    alert_inapp_provider = InAppNotificationProvider(sink=alert_broadcaster.publish)
+    _alert_providers = [alert_inapp_provider]
+    if settings.alert_webhook_url:
+        _alert_providers.append(
+            WebhookNotificationProvider(
+                settings.alert_webhook_url,
+                timeout_seconds=settings.alert_notification_timeout_seconds,
+            )
+        )
+    alert_dispatcher = NotificationDispatcher(
+        _alert_providers,
+        service.Session,
+        max_retries=settings.alert_notification_max_retries,
+        retry_delay_seconds=settings.alert_notification_retry_delay_seconds,
+    )
+    alert_publisher = AlertEventPublisher(event_publisher, settings.alert_kafka_topic)
+    alert_manager = AlertManager(
+        service.Session,
+        alert_state_store,
+        alert_publisher,
+        alert_dispatcher,
+        retention_hours=settings.alert_retention_hours,
+        expiry_interval_seconds=settings.alert_evaluation_interval_seconds,
+        queue_capacity=settings.alert_queue_capacity,
+    )
+    alert_manager.start()
+    alert_engine = AlertRuleEngine(
+        service.Session,
+        analytics_aggregator,
+        alert_manager,
+        alert_state_store,
+        default_cooldown_seconds=settings.alert_default_cooldown_seconds,
+        dedup_window_seconds=settings.alert_dedup_window_seconds,
+        rule_cache_ttl_seconds=settings.alert_rule_cache_ttl_seconds,
+        queue_capacity=settings.alert_queue_capacity,
+    )
+    alert_engine.start()
+    service.set_alerts(alert_engine)
+    logger.info("Alert engine initialized")
+
+# ---------------------------------------------------------------------------
 # Observability: readiness probe + background system sampler.
 # ---------------------------------------------------------------------------
 
@@ -523,6 +618,10 @@ async def lifespan(_app: FastAPI):
         logger.info("Application shutdown: stopping streams and disposing resources")
         stream_websockets.close_all()
         await asyncio.to_thread(service.shutdown)
+        if alert_engine is not None:
+            await asyncio.to_thread(alert_engine.stop)
+        if alert_manager is not None:
+            await asyncio.to_thread(alert_manager.stop)
         shutdown_frame_pool()
         if redis_client is not None:
             redis_client.close()
@@ -625,6 +724,94 @@ if getattr(settings, "recording_enabled", False) and getattr(settings, "recordin
     logger.info(f"Recording manager initialized at {settings.recording_storage_path}")
 
 app.include_router(recording_router.router)
+
+# ============================================================================
+# Analytics router integration
+# ============================================================================
+
+from backend.analytics.router import router as analytics_router
+
+if getattr(settings, "analytics_enabled", False):
+    analytics_router.set_manager(analytics_aggregator, cache)
+    app.include_router(analytics_router.router)
+    logger.info("Analytics router mounted at /analytics")
+
+# ============================================================================
+# Alert router integration
+# ============================================================================
+
+from backend.alerts.router import router as alerts_router
+
+if getattr(settings, "alert_engine_enabled", False):
+    alerts_router.set_manager(alert_engine, alert_manager, cache)
+    app.include_router(alerts_router.router)
+    logger.info("Alert router mounted at /alerts")
+
+
+@app.websocket("/alerts/ws")
+async def websocket_alerts(websocket: WebSocket):
+    """Live alert delivery over the existing authenticated WebSocket layer.
+
+    Carries only alert lifecycle payloads; the frame/event WebSocket contracts
+    are untouched. An optional ``stream_id`` query param filters to one stream.
+    """
+    if _auth_enabled:
+        user = await _authenticate_websocket(websocket)
+        if user is None:
+            await websocket.close(code=1008)
+            return
+    elif not _check_api_key(websocket.query_params.get("api_key")):
+        await websocket.close(code=1008)
+        return
+
+    if alert_engine is None or alert_broadcaster is None:
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept()
+    stream_filter = websocket.query_params.get("stream_id")
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=alert_broadcaster.max_queue)
+    alert_broadcaster.register(loop, queue)
+    om.WS_CONNECTIONS.labels(channel="alerts").inc()
+    om.WS_CONNECTIONS_TOTAL.labels(channel="alerts").inc()
+    logger.info("Alert WebSocket client connected")
+
+    async def _watch_disconnect() -> None:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+
+    disconnect_task = asyncio.create_task(_watch_disconnect())
+    get_task: Optional[asyncio.Task] = None
+    try:
+        while True:
+            get_task = asyncio.create_task(queue.get())
+            done, _ = await asyncio.wait(
+                {get_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                return
+            payload = get_task.result()
+            get_task = None
+            if stream_filter and payload.get("stream_id") != stream_filter:
+                continue
+            await websocket.send_json({"type": "alert", **payload})
+            om.WS_MESSAGES_SENT_TOTAL.labels(channel="alerts", type="alert").inc()
+    except WebSocketDisconnect:
+        logger.info("Alert WebSocket client disconnected")
+    finally:
+        for task in (get_task, disconnect_task):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (get_task, disconnect_task) if task is not None),
+            return_exceptions=True,
+        )
+        alert_broadcaster.unregister(loop, queue)
+        om.WS_CONNECTIONS.labels(channel="alerts").dec()
 
 
 @app.middleware("http")

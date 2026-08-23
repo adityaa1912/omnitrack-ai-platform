@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from queue import Queue
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from backend.recording.models import Recording, Snapshot, Evidence, EventRecordingLink
 from backend.recording.storage import StorageProvider
 from backend.observability import metrics as om
@@ -25,6 +25,7 @@ class RecordingManager:
         storage: StorageProvider,
         settings: Any,
     ) -> None:
+        self._session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
         self._db = db
         self._storage = storage
         self._settings = settings
@@ -179,6 +180,7 @@ class StreamRecorder:
     def __init__(self, stream_id: str, db: Session, storage: StorageProvider, settings: Any) -> None:
         self.stream_id = stream_id
         self._db = db
+        self._session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
         self._storage = storage
         self._settings = settings
         self._frame_queue: Queue = Queue(maxsize=120)
@@ -279,8 +281,9 @@ class StreamRecorder:
         return f"recordings/stream_{self.stream_id}/recording_{recording_id}_{event_type}_{ts}.mp4"
 
     def _process_event_clip(self, rec: Recording, event_type: str, event_data: dict, pre_frames: list, post_duration: float) -> None:
-        output_path = self._clip_path(rec.id, event_type)
+        session = self._session_factory()
         try:
+            output_path = self._clip_path(rec.id, event_type)
             from backend.recording.clip import generate_clip
             clip_data = generate_clip(
                 pre_frames=pre_frames,
@@ -298,14 +301,17 @@ class StreamRecorder:
                     file_path=clip_data.get("file_path", ""),
                     extra=event_data,
                 )
-                self._db.add(ev)
-                self._db.commit()
-                self._db.refresh(ev)
+                session.add(ev)
+                session.commit()
+                session.refresh(ev)
+                rec = session.get(Recording, rec.id)
                 if rec.extra is None:
                     rec.extra = {}
                 rec.extra["evidence_count"] = rec.extra.get("evidence_count", 0) + 1
-                self._db.commit()
+                session.commit()
                 om.EVIDENCES_CREATED_TOTAL.labels(stream_id=self.stream_id).inc()
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Error generating clip for {event_type}: {exc}")
             om.ENCODING_FAILURES_TOTAL.labels(stream_id=self.stream_id).inc()
+        finally:
+            session.close()

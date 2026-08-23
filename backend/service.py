@@ -44,6 +44,7 @@ from .model_manager import get_model_manager, shutdown_model_manager
 from .observability import correlation, metrics
 from .observability.errors import log_error
 from .observability.logging import get_logger
+from .analytics.aggregator import AnalyticsAggregator
 
 
 logger = get_logger(__name__, component="inference.stream")
@@ -652,6 +653,15 @@ class InferenceStream:
                 "event",
                 (time.perf_counter() - event_start) * 1000.0,
             )
+            if self._analytics is not None:
+                for record in stored:
+                    try:
+                        self._analytics.handle_event(record)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"Analytics event handling failed for "
+                            f"{self.config.stream_id}: {exc}"
+                        )
 
         return last_infer_at
 
@@ -854,6 +864,9 @@ class InferenceService:
         # to each stream's event buffer at stream start. ``None`` = no bus. The
         # callable is fail-safe and never raises into the inference loop.
         self._event_publisher: Optional[Callable[[Dict[str, Any]], None]] = None
+        # Optional analytics aggregator
+        self._analytics: Optional[AnalyticsAggregator] = None
+        self._alerts = None
 
         # Optional central scheduler. Built lazily on first use so the default
         # (disabled) deployment never constructs a worker pool at startup.
@@ -930,6 +943,13 @@ class InferenceService:
         """
         self._event_publisher = publisher
 
+    def set_analytics(self, analytics: AnalyticsAggregator) -> None:
+        """Register an optional analytics aggregator."""
+        self._analytics = analytics
+
+    def set_alerts(self, engine) -> None:
+        self._alerts = engine
+
     @staticmethod
     def _build_engine_with_retry(
         db_path: str,
@@ -999,6 +1019,28 @@ class InferenceService:
             except Exception as exc:  # noqa: BLE001 - bus must not affect streams
                 logger.warning(
                     f"Could not subscribe event publisher for "
+                    f"{config.stream_id}: {exc}"
+                )
+        # Subscribe the analytics aggregator so it receives every derived event.
+        # Guarded so a misbehaving aggregator can never block a stream start.
+        if self._analytics is not None:
+            try:
+                self.event_store.get(config.stream_id).subscribe(
+                    self._analytics.handle_event
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Could not subscribe analytics for "
+                    f"{config.stream_id}: {exc}"
+                )
+        if self._alerts is not None:
+            try:
+                self.event_store.get(config.stream_id).subscribe(
+                    self._alerts.handle_event
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Could not subscribe alert engine for "
                     f"{config.stream_id}: {exc}"
                 )
         stream.start()

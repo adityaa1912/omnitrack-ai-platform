@@ -548,6 +548,136 @@ STORAGE_USAGE_BYTES = Gauge(
 
 
 # ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+ANALYTICS_EVENTS_TOTAL = Counter(
+    "omnitrack_analytics_events_total",
+    "Total analytics events consumed, by stream and event type.",
+    labelnames=("stream_id", "event_type"),
+    registry=registry,
+)
+
+ANALYTICS_SUMMARIES_FLUSHED = Counter(
+    "omnitrack_analytics_summaries_flushed_total",
+    "Total analytics summary rows flushed to PostgreSQL.",
+    registry=registry,
+)
+
+ANALYTICS_FLUSHES_TOTAL = Counter(
+    "omnitrack_analytics_flushes_total",
+    "Total analytics flush cycles completed.",
+    registry=registry,
+)
+
+ANALYTICS_RETENTION_DELETES_TOTAL = Counter(
+    "omnitrack_analytics_retention_deletes_total",
+    "Total analytics summary rows deleted by retention policy.",
+    registry=registry,
+)
+
+ANALYTICS_CACHE_HITS_TOTAL = Counter(
+    "omnitrack_analytics_cache_hits_total",
+    "Total analytics cache hits.",
+    registry=registry,
+)
+
+ANALYTICS_CACHE_MISSES_TOTAL = Counter(
+    "omnitrack_analytics_cache_misses_total",
+    "Total analytics cache misses.",
+    registry=registry,
+)
+
+ANALYTICS_QUERY_LATENCY = Histogram(
+    "omnitrack_analytics_query_latency_seconds",
+    "Latency of analytics API queries in seconds.",
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+    registry=registry,
+)
+
+ANALYTICS_AGGREGATOR_STREAMS = Gauge(
+    "omnitrack_analytics_aggregator_streams",
+    "Number of streams currently tracked by the analytics aggregator.",
+    registry=registry,
+)
+
+ANALYTICS_OBJECT_COUNT = Gauge(
+    "omnitrack_analytics_object_count",
+    "Current in-memory object count for a stream, by class.",
+    labelnames=("stream_id", "class_name"),
+    registry=registry,
+)
+
+ANALYTICS_ZONE_OCCUPANCY = Gauge(
+    "omnitrack_analytics_zone_occupancy",
+    "Current zone occupancy in seconds for a stream, by zone.",
+    labelnames=("stream_id", "zone_name"),
+    registry=registry,
+)
+
+ANALYTICS_LINE_CROSSINGS = Counter(
+    "omnitrack_analytics_line_crossings_total",
+    "Total line crossings by direction, by stream and line.",
+    labelnames=("stream_id", "line_name", "direction"),
+    registry=registry,
+)
+
+
+# ---------------------------------------------------------------------------
+# Alert & Rule Engine
+# ---------------------------------------------------------------------------
+
+ALERT_RULES_EVALUATED_TOTAL = Counter(
+    "omnitrack_alert_rules_evaluated_total",
+    "Total alert rule evaluations performed.",
+    registry=registry,
+)
+
+ALERTS_TRIGGERED_TOTAL = Counter(
+    "omnitrack_alerts_triggered_total",
+    "Total alert instances triggered.",
+    registry=registry,
+)
+
+ALERTS_DEDUPLICATED_TOTAL = Counter(
+    "omnitrack_alerts_deduplicated_total",
+    "Total alert triggers suppressed by deduplication.",
+    registry=registry,
+)
+
+ALERTS_ACKNOWLEDGED_TOTAL = Counter(
+    "omnitrack_alerts_acknowledged_total",
+    "Total alerts acknowledged.",
+    registry=registry,
+)
+
+ALERTS_RESOLVED_TOTAL = Counter(
+    "omnitrack_alerts_resolved_total",
+    "Total alerts resolved.",
+    registry=registry,
+)
+
+ALERT_NOTIFICATIONS_SUCCESS_TOTAL = Counter(
+    "omnitrack_alert_notifications_success_total",
+    "Total successful alert notification deliveries.",
+    registry=registry,
+)
+
+ALERT_NOTIFICATIONS_FAILURE_TOTAL = Counter(
+    "omnitrack_alert_notifications_failure_total",
+    "Total failed alert notification deliveries (after retries).",
+    registry=registry,
+)
+
+ALERT_RULE_EVALUATION_LATENCY = Histogram(
+    "omnitrack_alert_rule_evaluation_latency_seconds",
+    "Latency of a single alert rule evaluation in seconds.",
+    buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5),
+    registry=registry,
+)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

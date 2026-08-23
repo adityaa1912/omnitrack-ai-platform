@@ -178,6 +178,29 @@ class Settings(BaseSettings):
     recording_storage_max_bytes: int | None = Field(None, ge=1)
     recording_segment_rotation_interval_seconds: int = Field(default=300, ge=60)
 
+    # Analytics engine. Disabled when analytics_enabled is false. Consumes
+    # derived events from the existing EventBuffer and maintains real-time
+    # in-memory counters plus periodic PostgreSQL summaries. Redis caching
+    # and Kafka publishing are optional and follow the same disabled-by-default
+    # pattern as the rest of the platform.
+    analytics_enabled: bool = False
+    analytics_aggregation_window_seconds: int = Field(default=60, ge=10)
+    analytics_retention_hours: int = Field(default=24, ge=1)
+    analytics_kafka_topic: str = Field(default="omnitrack.analytics", min_length=1)
+
+    alert_engine_enabled: bool = False
+    alert_evaluation_interval_seconds: int = Field(default=5, ge=1)
+    alert_default_cooldown_seconds: int = Field(default=60, ge=0)
+    alert_dedup_window_seconds: int = Field(default=300, ge=0)
+    alert_rule_cache_ttl_seconds: int = Field(default=10, ge=1)
+    alert_notification_max_retries: int = Field(default=3, ge=0)
+    alert_notification_retry_delay_seconds: float = Field(default=2.0, gt=0)
+    alert_notification_timeout_seconds: float = Field(default=5.0, gt=0)
+    alert_retention_hours: int = Field(default=168, ge=1)
+    alert_kafka_topic: str = Field(default="omnitrack.alerts", min_length=1)
+    alert_webhook_url: str | None = None
+    alert_queue_capacity: int = Field(default=1000, ge=1)
+
     logging_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     cors_origins: str = "*"
     api_key: str | None = None
