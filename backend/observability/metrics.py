@@ -676,6 +676,55 @@ ALERT_RULE_EVALUATION_LATENCY = Histogram(
     registry=registry,
 )
 
+WS_DISCONNECTS_TOTAL = Counter(
+    "omnitrack_websocket_disconnects_total",
+    "Total WebSocket disconnections, by channel.",
+    labelnames=("channel",),
+    registry=registry,
+)
+
+STREAM_LIFETIME_SECONDS = Histogram(
+    "omnitrack_stream_lifetime_seconds",
+    "Wall time a stream was active before stopping, in seconds.",
+    buckets=(5, 15, 30, 60, 120, 300, 600, 1800, 3600),
+    registry=registry,
+)
+
+WORKER_HEALTH = Gauge(
+    "omnitrack_worker_health",
+    "Background worker liveness: 1=running, 0=down.",
+    labelnames=("worker",),
+    registry=registry,
+)
+
+WORKER_FAILURES_TOTAL = Counter(
+    "omnitrack_worker_failures_total",
+    "Total uncaught background worker thread failures.",
+    labelnames=("worker",),
+    registry=registry,
+)
+
+WORKER_RESTARTS_TOTAL = Counter(
+    "omnitrack_worker_restarts_total",
+    "Total background worker restarts attempted by the supervisor.",
+    labelnames=("worker",),
+    registry=registry,
+)
+
+WORKER_QUEUE_DEPTH = Gauge(
+    "omnitrack_worker_queue_depth",
+    "Current input-queue depth for a background worker.",
+    labelnames=("worker",),
+    registry=registry,
+)
+
+DEPENDENCY_HEALTH = Gauge(
+    "omnitrack_dependency_health",
+    "Dependency reachability: 1=healthy, 0.5=degraded, 0=unhealthy.",
+    labelnames=("dependency",),
+    registry=registry,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

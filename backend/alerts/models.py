@@ -31,7 +31,7 @@ class AlertRule(Base):
     conditions = Column(JSON, nullable=False, default=list)
     condition_logic = Column(String(8), nullable=False, default="AND")
     severity = Column(String(32), nullable=False, default="warning")
-    priority = Column(Integer, nullable=False, default=0, index=True)
+    priority = Column(Integer, nullable=False, default=0)
     cooldown_seconds = Column(Integer, nullable=False, default=60)
     dedup_key_template = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)

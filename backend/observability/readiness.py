@@ -41,9 +41,10 @@ class CheckResult:
     name: str
     ok: bool
     detail: str = ""
+    degraded: bool = False
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "ok": self.ok, "detail": self.detail}
+        return {"name": self.name, "ok": self.ok, "detail": self.detail, "degraded": self.degraded}
 
 
 @dataclass
@@ -53,9 +54,14 @@ class ReadinessReport:
     ready: bool
     checks: List[CheckResult] = field(default_factory=list)
 
+    @property
+    def degraded(self) -> bool:
+        return any(c.degraded for c in self.checks)
+
     def to_dict(self) -> dict:
         return {
             "ready": self.ready,
+            "degraded": self.degraded,
             "checks": [c.to_dict() for c in self.checks],
         }
 
@@ -89,12 +95,18 @@ class ReadinessProbe:
         results: List[CheckResult] = []
         for check in checks:
             try:
-                results.append(check())
+                result = check()
+                results.append(result)
             except Exception as exc:  # noqa: BLE001 - a failing check is data
                 name = getattr(check, "__name__", "unknown")
-                results.append(
-                    CheckResult(name=name, ok=False, detail=f"check raised: {exc}")
-                )
+                result = CheckResult(name=name, ok=False, detail=f"check raised: {exc}")
+                results.append(result)
+            try:
+                from . import metrics as _m
+                dep_value = 1.0 if (result.ok and not result.degraded) else (0.5 if result.degraded else 0.0)
+                _m.DEPENDENCY_HEALTH.labels(dependency=result.name).set(dep_value)
+            except Exception:
+                pass
         ready = all(r.ok for r in results)
         return ReadinessReport(ready=ready, checks=results)
 
@@ -117,6 +129,7 @@ class SystemSampler:
         self._process = psutil.Process()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._queue_sources: list = []
 
     def start(self) -> None:
         """Start the sampler thread (idempotent)."""
@@ -139,6 +152,9 @@ class SystemSampler:
             self._thread.join(timeout=2.0)
             self._thread = None
 
+    def register_queue_source(self, name: str, depth_fn) -> None:
+        self._queue_sources.append((name, depth_fn))
+
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
@@ -151,3 +167,9 @@ class SystemSampler:
         metrics.PROCESS_CPU_PERCENT.set(self._process.cpu_percent(interval=None))
         metrics.PROCESS_MEMORY_BYTES.set(self._process.memory_info().rss)
         metrics.PROCESS_THREADS.set(self._process.num_threads())
+        for name, depth_fn in self._queue_sources:
+            try:
+                from . import metrics as _m
+                _m.WORKER_QUEUE_DEPTH.labels(worker=name).set(depth_fn())
+            except Exception:
+                pass

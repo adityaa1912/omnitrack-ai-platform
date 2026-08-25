@@ -31,6 +31,8 @@ from .observability import metrics as om
 from .observability.errors import log_error
 from .observability.logging import configure_logging, get_logger, shutdown_logging
 from .observability.readiness import CheckResult, ReadinessProbe, SystemSampler
+from .observability.supervisor import WorkerSupervisor
+from .observability.config_validator import validate_production_config, safe_effective_config
 from inference.types import Detection as InferenceDetection
 from inference.events.regions import Zone, CrossingLine
 from inference.frame_pool import (
@@ -306,6 +308,11 @@ readiness_probe = ReadinessProbe()
 system_sampler = SystemSampler(
     interval_seconds=settings.metrics_system_sample_interval_seconds
 )
+supervisor = WorkerSupervisor(
+    check_interval_seconds=settings.supervisor_check_interval_seconds
+)
+
+_stream_start_times: dict = {}
 
 
 def _check_model_available() -> CheckResult:
@@ -543,6 +550,44 @@ readiness_probe.register(_check_redis)
 readiness_probe.register(_check_kafka)
 
 
+def _check_recording() -> CheckResult:
+    if not getattr(settings, "recording_enabled", False):
+        return CheckResult(name="recording", ok=True, detail="disabled")
+    _rm = getattr(recording_router, "_manager", None)
+    if _rm is None:
+        return CheckResult(name="recording", ok=True, detail="not initialized")
+    return CheckResult(
+        name="recording",
+        ok=True,
+        detail=f"active_streams={len(_rm._streams)}",
+    )
+
+
+def _check_analytics() -> CheckResult:
+    if not getattr(settings, "analytics_enabled", False):
+        return CheckResult(name="analytics", ok=True, detail="disabled")
+    if analytics_aggregator is None:
+        return CheckResult(name="analytics", ok=False, detail="not initialized")
+    if not analytics_aggregator._running:
+        return CheckResult(name="analytics", ok=True, detail="stopped", degraded=True)
+    return CheckResult(name="analytics", ok=True, detail="running")
+
+
+def _check_alert_engine() -> CheckResult:
+    if not getattr(settings, "alert_engine_enabled", False):
+        return CheckResult(name="alert_engine", ok=True, detail="disabled")
+    if alert_engine is None:
+        return CheckResult(name="alert_engine", ok=False, detail="not initialized")
+    if not alert_engine._running:
+        return CheckResult(name="alert_engine", ok=True, detail="stopped", degraded=True)
+    return CheckResult(name="alert_engine", ok=True, detail="running")
+
+
+readiness_probe.register(_check_recording)
+readiness_probe.register(_check_analytics)
+readiness_probe.register(_check_alert_engine)
+
+
 class StreamWebSocketManager:
     """Coordinate live WebSocket handlers with a stream's lifecycle.
 
@@ -608,6 +653,22 @@ async def lifespan(_app: FastAPI):
         max_size=settings.frame_pool_max_size,
     )
     system_sampler.start()
+    validate_production_config(settings)
+    if alert_engine is not None:
+        supervisor.register("alert_engine", alert_engine, "_worker")
+    if alert_manager is not None:
+        supervisor.register("alert_manager", alert_manager, "_worker")
+    if analytics_aggregator is not None:
+        supervisor.register("analytics_aggregator", analytics_aggregator, "_flush_thread")
+    if alert_engine is not None:
+        system_sampler.register_queue_source(
+            "alert_engine", lambda: alert_engine._queue.qsize()
+        )
+    if alert_manager is not None:
+        system_sampler.register_queue_source(
+            "alert_manager", lambda: alert_manager._queue.qsize()
+        )
+    supervisor.start()
     logger.info(
         "Application startup: observability initialized",
         extra={"fields": {"environment": settings.environment}},
@@ -617,6 +678,7 @@ async def lifespan(_app: FastAPI):
     finally:
         logger.info("Application shutdown: stopping streams and disposing resources")
         stream_websockets.close_all()
+        supervisor.stop()
         await asyncio.to_thread(service.shutdown)
         if alert_engine is not None:
             await asyncio.to_thread(alert_engine.stop)
@@ -729,7 +791,7 @@ app.include_router(recording_router.router)
 # Analytics router integration
 # ============================================================================
 
-from backend.analytics.router import router as analytics_router
+from backend.analytics import router as analytics_router
 
 if getattr(settings, "analytics_enabled", False):
     analytics_router.set_manager(analytics_aggregator, cache)
@@ -740,7 +802,7 @@ if getattr(settings, "analytics_enabled", False):
 # Alert router integration
 # ============================================================================
 
-from backend.alerts.router import router as alerts_router
+from backend.alerts import router as alerts_router
 
 if getattr(settings, "alert_engine_enabled", False):
     alerts_router.set_manager(alert_engine, alert_manager, cache)
@@ -812,6 +874,7 @@ async def websocket_alerts(websocket: WebSocket):
         )
         alert_broadcaster.unregister(loop, queue)
         om.WS_CONNECTIONS.labels(channel="alerts").dec()
+        om.WS_DISCONNECTS_TOTAL.labels(channel="alerts").inc()
 
 
 @app.middleware("http")
@@ -1085,6 +1148,84 @@ async def prometheus_metrics():
     )
 
 
+@app.get("/admin/diagnostics")
+async def admin_diagnostics(
+    user: CurrentUser = Depends(require_role("admin")) if _auth_enabled else None,
+):
+    model_mgr_stats: dict = {}
+    if settings.model_manager_enabled:
+        _mm = getattr(service, "_model_manager", None)
+        if _mm is not None:
+            model_mgr_stats = _mm.stats()
+
+    queue_depths: dict = {}
+    if alert_engine is not None:
+        try:
+            queue_depths["alert_engine"] = alert_engine._queue.qsize()
+        except Exception:
+            pass
+    if alert_manager is not None:
+        try:
+            queue_depths["alert_manager"] = alert_manager._queue.qsize()
+        except Exception:
+            pass
+
+    cache_reachable = False
+    if redis_client is not None:
+        try:
+            cache_reachable = redis_client.ping()
+        except Exception:
+            pass
+
+    recording_active: list = []
+    if getattr(settings, "recording_enabled", False):
+        _rm = getattr(recording_router, "_manager", None)
+        if _rm is not None:
+            recording_active = list(_rm._streams.keys())
+
+    dependency_report = readiness_probe.evaluate()
+
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "active_streams": list(service.streams.keys()),
+        "workers": supervisor.worker_snapshots(),
+        "inference": {
+            "provider": settings.inference_provider,
+            "model": settings.model_path,
+            "device": settings.inference_device,
+        },
+        "model_manager": {
+            "enabled": settings.model_manager_enabled,
+            "loaded": model_mgr_stats.get("loaded", 0),
+            "in_use": model_mgr_stats.get("in_use", 0),
+            "max_loaded": settings.model_manager_max_loaded,
+        },
+        "queue_depths": queue_depths,
+        "cache": {
+            "enabled": redis_client is not None,
+            "reachable": cache_reachable,
+        },
+        "recording": {
+            "enabled": getattr(settings, "recording_enabled", False),
+            "active_streams": recording_active,
+        },
+        "alert_engine": {
+            "enabled": getattr(settings, "alert_engine_enabled", False),
+            "running": alert_engine is not None and alert_engine._running,
+            "queue_size": queue_depths.get("alert_engine", 0),
+        },
+        "analytics": {
+            "enabled": getattr(settings, "analytics_enabled", False),
+            "running": analytics_aggregator is not None and analytics_aggregator._running,
+        },
+        "dependencies": {
+            c["name"]: {"ok": c["ok"], "detail": c["detail"], "degraded": c["degraded"]}
+            for c in dependency_report.to_dict()["checks"]
+        },
+        "effective_config": safe_effective_config(settings),
+    }
+
+
 @app.post("/stream/start", response_model=MetricsResponse)
 async def start_stream(
     request: StartStreamRequest,
@@ -1134,6 +1275,7 @@ async def start_stream(
             dwell_seconds=request.dwell_seconds,
         )
         metrics = service.start_stream(config)
+        _stream_start_times[request.stream_id] = time.monotonic()
 
         return MetricsResponse(
             stream_id=metrics.stream_id,
@@ -1163,6 +1305,9 @@ async def stop_stream(
         # ``stop`` may join the inference thread; never block the ASGI loop
         # while WebSocket handlers are processing their lifecycle signal.
         await asyncio.to_thread(service.stop_stream, stream_id)
+        _t0 = _stream_start_times.pop(stream_id, None)
+        if _t0 is not None:
+            om.STREAM_LIFETIME_SECONDS.observe(time.monotonic() - _t0)
         return {"status": "stopped", "stream_id": stream_id}
 
     except ValueError as e:
@@ -1497,6 +1642,7 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
         )
         stream_websockets.unregister(stream_id, stop_event)
         om.WS_CONNECTIONS.labels(channel="frames").dec()
+        om.WS_DISCONNECTS_TOTAL.labels(channel="frames").inc()
         correlation.clear_stream_context()
 
 
@@ -1671,6 +1817,7 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
         await asyncio.gather(send_task, watch_task, stop_task, return_exceptions=True)
         stream_websockets.unregister(stream_id, stop_event)
         om.WS_CONNECTIONS.labels(channel="events").dec()
+        om.WS_DISCONNECTS_TOTAL.labels(channel="events").inc()
         correlation.clear_stream_context()
         logger.info(f"Event WebSocket client disconnected from stream {stream_id}")
 

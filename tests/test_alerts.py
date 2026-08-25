@@ -35,7 +35,7 @@ from backend.alerts.models import (
     AlertStateHistory,
     NotificationAttempt,
 )
-from backend.alerts.router import router as alerts_router
+from backend.alerts import router as alerts_router
 
 
 def _snapshot(**kwargs):

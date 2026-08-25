@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..observability import metrics as om
+from ..observability import correlation as _correlation
 from ..observability.logging import get_logger
 from .manager import AlertManager
 from .models import AlertRule
@@ -81,6 +82,9 @@ class AlertRuleEngine:
             except queue.Empty:
                 continue
             try:
+                stream_id = record.get("stream_id")
+                if stream_id:
+                    _correlation.bind_stream_context(stream_id=stream_id)
                 self._evaluate(record)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Alert evaluation error: {exc}")

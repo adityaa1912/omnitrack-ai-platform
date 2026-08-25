@@ -90,6 +90,7 @@ class JsonFormatter(logging.Formatter):
             "stream_id": correlation.get_stream_id() or "-",
             "camera_id": correlation.get_camera_id() or "-",
             "event_id": correlation.get_event_id() or "-",
+            "user_id": correlation.get_user_id() or "-",
             "thread": f"{record.threadName}:{record.thread}",
             "message": message,
             "exception": exception,

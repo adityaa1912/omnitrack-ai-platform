@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from backend.auth.security import decode_jwt, Role, role_satisfies
 from backend.settings import get_settings
+from backend.observability import correlation as _correlation
 
 
 class TokenPayload:
@@ -134,6 +135,7 @@ async def get_current_user(
                     detail="Session revoked or expired",
                 )
 
+    _correlation.bind_user_id(user.id)
     return CurrentUser(
         user_id=user.id,
         username=user.username,

@@ -226,6 +226,7 @@ class Settings(BaseSettings):
     # memory / thread gauges are refreshed off the request path.
     metrics_enabled: bool = True
     metrics_system_sample_interval_seconds: float = Field(default=5.0, gt=0)
+    supervisor_check_interval_seconds: float = Field(default=5.0, gt=0)
     # Header name consulted for an incoming correlation/request id. When absent
     # or empty, a fresh id is generated. The id is always echoed back on the
     # ``X-Request-ID`` response header.

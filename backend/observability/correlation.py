@@ -130,3 +130,20 @@ def clear_stream_context() -> None:
     _stream_id.set(None)
     _camera_id.set(None)
     _event_id.set(None)
+
+
+_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "omnitrack_user_id", default=None
+)
+
+
+def bind_user_id(user_id) -> None:
+    _user_id.set(str(user_id) if user_id is not None else None)
+
+
+def get_user_id() -> Optional[str]:
+    return _user_id.get()
+
+
+def clear_user_id() -> None:
+    _user_id.set(None)

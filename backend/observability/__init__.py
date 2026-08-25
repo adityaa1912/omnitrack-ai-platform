@@ -10,14 +10,16 @@ Import the pieces you need from the submodules; this package intentionally
 keeps a shallow, explicit surface.
 """
 
-from . import correlation, errors, metrics, readiness
+from . import correlation, config_validator, errors, metrics, readiness, supervisor
 from .logging import configure_logging, get_logger, shutdown_logging
 
 __all__ = [
     "correlation",
+    "config_validator",
     "errors",
     "metrics",
     "readiness",
+    "supervisor",
     "configure_logging",
     "get_logger",
     "shutdown_logging",
