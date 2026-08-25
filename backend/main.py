@@ -48,6 +48,11 @@ logger = get_logger(__name__, component="backend.api")
 
 _auth_enabled = bool(getattr(settings, "jwt_secret", None))
 
+
+def _no_auth_user():
+    return None
+
+
 from backend.auth.dependencies import get_current_user, get_current_user_optional, require_role, CurrentUser
 
 
@@ -1229,7 +1234,7 @@ async def admin_diagnostics(
 @app.post("/stream/start", response_model=MetricsResponse)
 async def start_stream(
     request: StartStreamRequest,
-    user: CurrentUser = Depends(require_role("operator")) if _auth_enabled else None,
+    user: Optional[CurrentUser] = Depends(require_role("operator") if _auth_enabled else _no_auth_user),
 ):
     """Start a new inference stream."""
     # Translate scene-region specs into inference geometry up front, so invalid
@@ -1295,7 +1300,7 @@ async def start_stream(
 @app.post("/stream/stop")
 async def stop_stream(
     stream_id: str,
-    user: CurrentUser = Depends(require_role("operator")) if _auth_enabled else None,
+    user: Optional[CurrentUser] = Depends(require_role("operator") if _auth_enabled else _no_auth_user),
 ):
     """Stop an inference stream."""
     try:
@@ -1427,7 +1432,7 @@ async def get_regions(
 async def update_regions(
     stream_id: str,
     request: RegionsUpdateRequest,
-    user: CurrentUser = Depends(require_role("operator")) if _auth_enabled else None,
+    user: Optional[CurrentUser] = Depends(require_role("operator") if _auth_enabled else _no_auth_user),
 ):
     """Replace a running stream's scene regions live — no restart.
 

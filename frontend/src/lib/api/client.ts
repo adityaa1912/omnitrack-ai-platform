@@ -65,10 +65,34 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     } catch {
       detail = await response.text().catch(() => undefined);
     }
+    const normalizeDetail = (value: unknown): string | undefined => {
+      if (value == null) return undefined;
+      if (typeof value === "string") return value;
+      if (Array.isArray(value)) {
+        const parts = value
+          .map((item) => {
+            if (item && typeof item === "object" && "msg" in item) {
+              const msg = String((item as { msg: unknown }).msg);
+              const loc = (item as { loc?: unknown }).loc;
+              return Array.isArray(loc) ? `${msg} (${loc.join(".")})` : msg;
+            }
+            return typeof item === "string" ? item : JSON.stringify(item);
+          })
+          .filter(Boolean);
+        return parts.length > 0 ? parts.join("; ") : undefined;
+      }
+      if (typeof value === "object" && "msg" in value) {
+        return String((value as { msg: unknown }).msg);
+      }
+      return JSON.stringify(value);
+    };
+    const innerDetail =
+      detail && typeof detail === "object" && "detail" in detail
+        ? (detail as { detail: unknown }).detail
+        : detail;
     const message =
-      (detail && typeof detail === "object" && "detail" in detail
-        ? String((detail as { detail: unknown }).detail)
-        : undefined) ?? `Request failed with status ${response.status}`;
+      normalizeDetail(innerDetail) ??
+      `Request failed with status ${response.status}`;
     throw new ApiError(response.status, message, detail);
   }
 

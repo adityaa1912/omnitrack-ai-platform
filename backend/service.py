@@ -45,7 +45,10 @@ from .observability import correlation, metrics
 from .observability.errors import log_error
 from .observability.logging import get_logger
 from .analytics.aggregator import AnalyticsAggregator
+from .settings import get_settings
 
+
+settings = get_settings()
 
 logger = get_logger(__name__, component="inference.stream")
 
