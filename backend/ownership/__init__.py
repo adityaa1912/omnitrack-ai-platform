@@ -21,7 +21,6 @@ import uuid
 from typing import Callable, Optional
 
 import redis
-
 from ..observability.logging import get_logger
 from ..observability.metrics import (
     LEASE_ACQUISITIONS_TOTAL,
