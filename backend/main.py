@@ -26,6 +26,7 @@ from .service import InferenceService, StreamConfig, StreamMetrics
 from .settings import get_settings
 from .cache import JsonCache, create_redis_client
 from .messaging import KafkaEventPublisher, create_kafka_producer
+from .ownership import LeaseManager, LeaderLease
 from .observability import correlation
 from .observability import metrics as om
 from .observability.errors import log_error
@@ -114,6 +115,25 @@ def _check_api_key(provided: Optional[str]) -> bool:
     return hmac.compare_digest(provided, API_KEY)
 
 
+def _should_redirect(owner: Optional[str], local: str) -> bool:
+    """Whether a stream WebSocket must be redirected to the owning replica.
+
+    Redirect only when another replica demonstrably owns the stream: an
+    unknown owner (``None``) never redirects, so a Redis outage degrades to
+    serving locally instead of bouncing clients.
+    """
+    return owner is not None and owner != local
+
+
+def _owner_redirect_payload(stream_id: str, owner: str) -> dict:
+    """The single owner-redirect message contract for stream WebSockets."""
+    return {
+        "type": "owner_redirect",
+        "stream_id": stream_id,
+        "owner": owner,
+    }
+
+
 def _build_geometry(zone_specs, line_specs):
     """Translate region specs into inference ``Zone``/``CrossingLine`` objects.
 
@@ -193,6 +213,36 @@ redis_client = create_redis_client(
 cache = JsonCache(redis_client, default_ttl_seconds=settings.redis_default_ttl_seconds)
 
 # ---------------------------------------------------------------------------
+# Distributed multi-replica mode (opt-in, requires Redis). The lease manager
+# gives this replica a stable identity, enforces single-owner streams via
+# TTL leases renewed by a heartbeat thread, and fails safe on Redis loss
+# (leases stop being claimed/renewed; owned streams are stopped). Disabled
+# by default: single-replica behavior is byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+lease_manager = None
+distributed_enabled = bool(
+    getattr(settings, "distributed_enabled", False)
+) and redis_client is not None
+if distributed_enabled:
+    lease_manager = LeaseManager(
+        redis_client.client,
+        instance_id=getattr(settings, "instance_id", None),
+        ttl_seconds=settings.lease_ttl_seconds,
+        heartbeat_interval_seconds=settings.lease_heartbeat_interval_seconds,
+        acquire_timeout_seconds=settings.lease_acquire_timeout_seconds,
+    )
+    lease_manager.start()
+    service.set_lease_manager(lease_manager)
+    om.INSTANCE_ID.labels(instance_id=lease_manager.instance_id).set(1)
+    logger.info(
+        "Distributed mode enabled: instance=%s ttl=%ss heartbeat=%ss",
+        lease_manager.instance_id,
+        settings.lease_ttl_seconds,
+        settings.lease_heartbeat_interval_seconds,
+    )
+
+# ---------------------------------------------------------------------------
 # Optional Kafka event bus. Disabled by default (``kafka_enabled=False``); when
 # enabled the producer connects lazily in the background so an unreachable
 # broker never blocks startup. Only derived events are published — never raw
@@ -224,10 +274,21 @@ if getattr(settings, "analytics_enabled", False):
     from backend.analytics.aggregator import AnalyticsAggregator
     from backend.analytics.publisher import AnalyticsEventPublisher
 
+    _analytics_leader = (
+        LeaderLease(
+            redis_client.client,
+            "analytics-flush",
+            lease_manager.instance_id,
+            ttl_seconds=max(settings.analytics_aggregation_window_seconds, 10),
+        )
+        if lease_manager is not None
+        else None
+    )
     analytics_aggregator = AnalyticsAggregator(
         service.Session,
         aggregation_window_seconds=settings.analytics_aggregation_window_seconds,
         retention_hours=settings.analytics_retention_hours,
+        leader_claim=_analytics_leader.claim if _analytics_leader else None,
     )
     analytics_aggregator.start()
     service.set_analytics(analytics_aggregator)
@@ -281,6 +342,16 @@ if getattr(settings, "alert_engine_enabled", False):
         retry_delay_seconds=settings.alert_notification_retry_delay_seconds,
     )
     alert_publisher = AlertEventPublisher(event_publisher, settings.alert_kafka_topic)
+    _alert_leader = (
+        LeaderLease(
+            redis_client.client,
+            "alert-expiry",
+            lease_manager.instance_id,
+            ttl_seconds=max(settings.alert_evaluation_interval_seconds, 1),
+        )
+        if lease_manager is not None
+        else None
+    )
     alert_manager = AlertManager(
         service.Session,
         alert_state_store,
@@ -289,6 +360,7 @@ if getattr(settings, "alert_engine_enabled", False):
         retention_hours=settings.alert_retention_hours,
         expiry_interval_seconds=settings.alert_evaluation_interval_seconds,
         queue_capacity=settings.alert_queue_capacity,
+        leader_claim=_alert_leader.claim if _alert_leader else None,
     )
     alert_manager.start()
     alert_engine = AlertRuleEngine(
@@ -523,8 +595,18 @@ def _check_redis() -> CheckResult:
     if redis_client is None:
         return CheckResult(name="redis", ok=True, detail="disabled")
     if redis_client.ping():
+        if distributed_enabled and lease_manager is not None:
+            return CheckResult(
+                name="redis",
+                ok=True,
+                detail=f"reachable; instance={lease_manager.instance_id}",
+            )
         return CheckResult(name="redis", ok=True, detail="reachable")
-    return CheckResult(name="redis", ok=False, detail="unreachable")
+    return CheckResult(
+        name="redis",
+        ok=False,
+        detail="unreachable" + (" (distributed leases depend on it)" if distributed_enabled else ""),
+    )
 
 
 def _check_kafka() -> CheckResult:
@@ -659,6 +741,8 @@ async def lifespan(_app: FastAPI):
     )
     system_sampler.start()
     validate_production_config(settings)
+    if lease_manager is not None:
+        supervisor.register("lease_heartbeat", lease_manager, "_thread")
     if alert_engine is not None:
         supervisor.register("alert_engine", alert_engine, "_worker")
     if alert_manager is not None:
@@ -689,6 +773,12 @@ async def lifespan(_app: FastAPI):
             await asyncio.to_thread(alert_engine.stop)
         if alert_manager is not None:
             await asyncio.to_thread(alert_manager.stop)
+        if lease_manager is not None:
+            lease_manager.stop(
+                grace_seconds=min(
+                    settings.graceful_shutdown_timeout_seconds, 5.0
+                )
+            )
         shutdown_frame_pool()
         if redis_client is not None:
             redis_client.close()
@@ -1545,6 +1635,21 @@ async def websocket_stream(websocket: WebSocket, stream_id: str):
     )
     stop_event = stream_websockets.register(stream_id)
 
+    if distributed_enabled:
+        owner = await asyncio.to_thread(service.stream_owner, stream_id)
+        local = lease_manager.instance_id if lease_manager else None
+        if _should_redirect(owner, local):
+            om.STREAM_REASSIGNMENTS_TOTAL.labels(stream_id=stream_id).inc()
+            logger.info(
+                f"Stream {stream_id} owned by {owner}; requesting client redirect"
+            )
+            try:
+                await websocket.send_json(_owner_redirect_payload(stream_id, owner))
+            except Exception:  # noqa: BLE001 - client may already be gone
+                pass
+            await _close_stopped_stream_socket(websocket)
+            return
+
     async def _watch_disconnect() -> None:
         """Wait for a client close while frame delivery is otherwise idle."""
         while True:
@@ -1702,6 +1807,21 @@ async def websocket_events(websocket: WebSocket, stream_id: str):
         extra={"fields": {"channel": "events"}},
     )
     stop_event = stream_websockets.register(stream_id)
+
+    if distributed_enabled:
+        owner = await asyncio.to_thread(service.stream_owner, stream_id)
+        local = lease_manager.instance_id if lease_manager else None
+        if _should_redirect(owner, local):
+            om.STREAM_REASSIGNMENTS_TOTAL.labels(stream_id=stream_id).inc()
+            logger.info(
+                f"Stream {stream_id} owned by {owner}; requesting client redirect"
+            )
+            try:
+                await websocket.send_json(_owner_redirect_payload(stream_id, owner))
+            except Exception:  # noqa: BLE001 - client may already be gone
+                pass
+            await _close_stopped_stream_socket(websocket)
+            return
 
     # Do not create an EventBuffer for an unknown/deleted stream.  Register
     # first so a stop racing this accepted connection cannot be missed.

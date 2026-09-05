@@ -1,0 +1,29 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: omnitrack-backend-pdb
+  namespace: omnitrack
+  labels:
+    app.kubernetes.io/name: omnitrack
+    app.kubernetes.io/component: backend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnitrack
+      app.kubernetes.io/component: backend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: omnitrack-frontend-pdb
+  namespace: omnitrack
+  labels:
+    app.kubernetes.io/name: omnitrack
+    app.kubernetes.io/component: frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: omnitrack
+      app.kubernetes.io/component: frontend

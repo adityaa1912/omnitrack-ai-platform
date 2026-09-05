@@ -37,6 +37,7 @@ class AlertManager:
         retention_hours: int = 168,
         expiry_interval_seconds: int = 30,
         queue_capacity: int = 1000,
+        leader_claim=None,
     ) -> None:
         self._session_factory = session_factory
         self._state = state_store
@@ -44,6 +45,7 @@ class AlertManager:
         self._dispatcher = dispatcher
         self._retention_hours = retention_hours
         self._expiry_interval = expiry_interval_seconds
+        self._leader_claim = leader_claim
         self._queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=queue_capacity)
         self._running = False
         self._worker: Optional[threading.Thread] = None
@@ -282,10 +284,19 @@ class AlertManager:
             now = time.time()
             if now - last_expiry >= self._expiry_interval:
                 last_expiry = now
-                try:
-                    self.run_expiry()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Expiry pass error: {exc}")
+                if self._is_leader():
+                    try:
+                        self.run_expiry()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"Expiry pass error: {exc}")
+
+    def _is_leader(self) -> bool:
+        if self._leader_claim is None:
+            return True
+        try:
+            return bool(self._leader_claim())
+        except Exception:  # noqa: BLE001 - expiry must never die on Redis
+            return True
 
     def _drain(self) -> None:
         while True:

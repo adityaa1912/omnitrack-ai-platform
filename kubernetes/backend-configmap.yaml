@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omnitrack-backend-config
+  namespace: omnitrack
+  labels:
+    app.kubernetes.io/name: omnitrack
+    app.kubernetes.io/component: backend
+data:
+  OMNITRACK_ENVIRONMENT: "production"
+  OMNITRACK_API_HOST: "0.0.0.0"
+  OMNITRACK_API_PORT: "8000"
+  OMNITRACK_API_WORKERS: "1"
+  OMNITRACK_REDIS_ENABLED: "true"
+  OMNITRACK_REDIS_URL: "redis://redis.omnitrack.svc.cluster.local:6379/0"
+  OMNITRACK_POSTGRES_URL: "postgresql+psycopg://omnitrack:omnitrack@postgres.omnitrack.svc.cluster.local:5432/omnitrack"
+  OMNITRACK_KAFKA_ENABLED: "true"
+  OMNITRACK_KAFKA_BOOTSTRAP_SERVERS: "kafka.omnitrack.svc.cluster.local:9092"
+  OMNITRACK_DISTRIBUTED_ENABLED: "true"
+  OMNITRACK_LEASE_TTL_SECONDS: "15"
+  OMNITRACK_LEASE_HEARTBEAT_INTERVAL_SECONDS: "5"
+  OMNITRACK_LEASE_ACQUIRE_TIMEOUT_SECONDS: "2"
+  OMNITRACK_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: "30"
+  OMNITRACK_SCALING_MIN_REPLICAS: "2"
+  OMNITRACK_SCALING_MAX_REPLICAS: "10"
+  OMNITRACK_RECORDING_ENABLED: "false"
+  OMNITRACK_ALERT_ENGINE_ENABLED: "true"
+  OMNITRACK_ANALYTICS_ENABLED: "true"
+  OMNITRACK_INFERENCE_PROVIDER: "torch"

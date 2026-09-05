@@ -725,6 +725,47 @@ DEPENDENCY_HEALTH = Gauge(
     registry=registry,
 )
 
+INSTANCE_ID = Gauge(
+    "omnitrack_instance_id",
+    "Constant gauge carrying the process instance identity as a label.",
+    labelnames=("instance_id",),
+    registry=registry,
+)
+
+LEASE_OWNED_STREAMS = Gauge(
+    "omnitrack_lease_owned_streams",
+    "Number of streams this replica holds leases for.",
+    registry=registry,
+)
+
+LEASE_ACQUISITIONS_TOTAL = Counter(
+    "omnitrack_lease_acquisitions_total",
+    "Stream lease acquisitions, by outcome.",
+    labelnames=("outcome",),
+    registry=registry,
+)
+
+LEASE_HEARTBEATS_TOTAL = Counter(
+    "omnitrack_lease_heartbeats_total",
+    "Stream lease heartbeats, by outcome.",
+    labelnames=("outcome",),
+    registry=registry,
+)
+
+LEASE_LOSSES_TOTAL = Counter(
+    "omnitrack_lease_losses_total",
+    "Stream leases lost (expired, stolen, or Redis failure), by reason.",
+    labelnames=("reason",),
+    registry=registry,
+)
+
+STREAM_REASSIGNMENTS_TOTAL = Counter(
+    "omnitrack_stream_reassignments_total",
+    "Streams reassigned between replicas (ownership takeover observed).",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

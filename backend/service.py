@@ -45,6 +45,7 @@ from .observability import correlation, metrics
 from .observability.errors import log_error
 from .observability.logging import get_logger
 from .analytics.aggregator import AnalyticsAggregator
+from .ownership import LeaseManager
 from .settings import get_settings
 
 
@@ -887,6 +888,19 @@ class InferenceService:
         self._model_manager_max_loaded = model_manager_max_loaded
         self._model_manager_lock = threading.Lock()
 
+        # Optional Redis lease manager for distributed multi-replica mode.
+        # ``None`` in single-process mode: every guard below then degrades to
+        # the original un-leased behavior.
+        self._lease_manager: Optional[LeaseManager] = None
+        self._distributed = False
+
+    def set_lease_manager(self, lease_manager: Optional[LeaseManager]) -> None:
+        """Register the distributed-mode lease manager (or clear it)."""
+        self._lease_manager = lease_manager
+        self._distributed = lease_manager is not None
+        if lease_manager is not None:
+            metrics.INSTANCE_ID.labels(instance_id=lease_manager.instance_id).set(1)
+
     def _get_model_manager(self):
         """Return the lazy-built model manager, or None when it is disabled."""
         if not self._model_manager_enabled:
@@ -1027,6 +1041,8 @@ class InferenceService:
                     f"Could not subscribe analytics for "
                     f"{config.stream_id}: {exc}"
                 )
+        # Subscribe the alert engine last, after analytics, so both observe the
+        # same EventBuffer.
         if self._alerts is not None:
             try:
                 self.event_store.get(config.stream_id).subscribe(
@@ -1037,6 +1053,21 @@ class InferenceService:
                     f"Could not subscribe alert engine for "
                     f"{config.stream_id}: {exc}"
                 )
+        # Distributed mode: acquire the Redis lease BEFORE any resource is
+        # opened. Exactly one replica can hold it; losing the race here means
+        # another replica already owns this stream, so we refuse to start.
+        if self._lease_manager is not None:
+            lease = self._lease_manager.acquire(config.stream_id)
+            if lease is None:
+                owner = self._lease_manager.owner_of(config.stream_id)
+                metrics.LEASE_ACQUISITIONS_TOTAL.labels(
+                    outcome="duplicate_start_rejected"
+                ).inc()
+                raise ValueError(
+                    f"Stream {config.stream_id} already owned by replica "
+                    f"{owner!r}"
+                )
+            metrics.LEASE_OWNED_STREAMS.set(len(self._lease_manager.leases))
         stream.start()
         with self._streams_lock:
             self.streams[config.stream_id] = stream
@@ -1056,6 +1087,13 @@ class InferenceService:
         try:
             stream.stop()
         finally:
+            # Distributed mode: release the lease while we still hold the
+            # registry entry, so takeover can start immediately after.
+            if self._lease_manager is not None:
+                if self._lease_manager.release(stream_id):
+                    metrics.LEASE_OWNED_STREAMS.set(
+                        len(self._lease_manager.leases)
+                    )
             with self._streams_lock:
                 # Do not remove a newer stream that reused the id after this
                 # stream was stopped.
@@ -1069,6 +1107,20 @@ class InferenceService:
         """Return whether ``stream_id`` is still registered as live."""
         with self._streams_lock:
             return stream_id in self.streams
+
+    def stream_owner(self, stream_id: str) -> Optional[str]:
+        """Return the instance id of this stream's lease owner, or ``None``.
+
+        In single-process mode (no lease manager) the answer is the local
+        process whenever the stream is registered locally.
+        """
+        if self._lease_manager is not None:
+            return self._lease_manager.owner_of(stream_id)
+        return (
+            self._local_instance_id if self.has_stream(stream_id) else None
+        )
+
+    _local_instance_id = "local"
 
     def shutdown(self) -> None:
         """
@@ -1084,6 +1136,14 @@ class InferenceService:
             return
         self._is_shutdown = True
 
+        # Distributed mode: stop heartbeating first, then release every lease
+        # as each stream stops, so a graceful pod termination hands streams
+        # over instead of leaving them to expire.
+        if self._lease_manager is not None:
+            self._lease_manager.stop(
+                grace_seconds=get_settings().graceful_shutdown_timeout_seconds
+            )
+
         for stream_id in list(self.streams.keys()):
             try:
                 self.stop_stream(stream_id)
@@ -1094,6 +1154,8 @@ class InferenceService:
                     f"Error stopping stream {stream_id} during shutdown",
                     stream_id=stream_id,
                 )
+                if self._lease_manager is not None:
+                    self._lease_manager.release(stream_id)
 
         # Stop the shared worker pool (if it was ever built) after every stream's
         # capture thread has been stopped, so no worker is processing a stream.

@@ -238,6 +238,39 @@ class Settings(BaseSettings):
     healthcheck_retries: int = Field(default=3, ge=1)
     container_stop_grace_period_seconds: int = Field(default=15, ge=1)
 
+    # Distributed multi-replica mode (opt-in). Requires Redis. When enabled,
+    # every stream must hold a Redis lease (TTL + heartbeat) before this
+    # replica starts inference, so exactly one replica owns a stream at a
+    # time; authenticated stream WebSockets reach the owning replica via
+    # proxy-by-owner. Defaults keep single-process behavior unchanged.
+    distributed_enabled: bool = False
+    instance_id: str | None = None
+    lease_ttl_seconds: float = Field(default=15.0, gt=0)
+    lease_heartbeat_interval_seconds: float = Field(default=5.0, gt=0)
+    lease_acquire_timeout_seconds: float = Field(default=2.0, ge=0)
+    graceful_shutdown_timeout_seconds: float = Field(default=30.0, gt=0)
+    scaling_min_replicas: int = Field(default=2, ge=1)
+    scaling_max_replicas: int = Field(default=10, ge=1)
+
+    @model_validator(mode="after")
+    def _distributed_requires_redis(self) -> "Settings":
+        if self.distributed_enabled and not self.resolved_redis_url:
+            raise ValueError(
+                "OMNITRACK_DISTRIBUTED_ENABLED=true requires "
+                "OMNITRACK_REDIS_ENABLED=true and OMNITRACK_REDIS_URL"
+            )
+        if self.lease_heartbeat_interval_seconds >= self.lease_ttl_seconds:
+            raise ValueError(
+                "OMNITRACK_LEASE_HEARTBEAT_INTERVAL_SECONDS must be less "
+                "than OMNITRACK_LEASE_TTL_SECONDS"
+            )
+        if self.scaling_max_replicas < self.scaling_min_replicas:
+            raise ValueError(
+                "OMNITRACK_SCALING_MAX_REPLICAS must be greater than or "
+                "equal to OMNITRACK_SCALING_MIN_REPLICAS"
+            )
+        return self
+
     frontend_api_url: str = Field(
         default="/api", validation_alias="VITE_API_BASE_URL"
     )

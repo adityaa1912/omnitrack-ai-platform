@@ -37,11 +37,13 @@ class AnalyticsAggregator:
         aggregation_window_seconds: int = 60,
         retention_hours: int = 24,
         trajectory_snapshot_on_disappear: bool = True,
+        leader_claim=None,
     ) -> None:
         self._session_factory = session_factory
         self._window_seconds = aggregation_window_seconds
         self._retention_hours = retention_hours
         self._snapshot_on_disappear = trajectory_snapshot_on_disappear
+        self._leader_claim = leader_claim
 
         self._lock = threading.Lock()
         self._per_stream: Dict[str, _StreamAgg] = {}
@@ -131,8 +133,20 @@ class AnalyticsAggregator:
         """Background thread that periodically flushes analytics to PostgreSQL."""
         while self._running:
             time.sleep(max(self._window_seconds, 10))
-            if self._running:
+            if self._running and self._is_leader():
                 self._flush_once()
+                try:
+                    self._enforce_retention(self._session_factory)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Analytics retention pass failed: {exc}")
+
+    def _is_leader(self) -> bool:
+        if self._leader_claim is None:
+            return True
+        try:
+            return bool(self._leader_claim())
+        except Exception:  # noqa: BLE001 - analytics must never die on Redis
+            return True
 
     def _flush_once(self) -> None:
         """Flush all streams' current window to PostgreSQL."""
