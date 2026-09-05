@@ -656,15 +656,6 @@ class InferenceStream:
                 "event",
                 (time.perf_counter() - event_start) * 1000.0,
             )
-            if self._analytics is not None:
-                for record in stored:
-                    try:
-                        self._analytics.handle_event(record)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            f"Analytics event handling failed for "
-                            f"{self.config.stream_id}: {exc}"
-                        )
 
         return last_infer_at
 
