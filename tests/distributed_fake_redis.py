@@ -31,7 +31,7 @@ class FakeRedis:
             if current is not None and expires_at > now:
                 if nx:
                     return None
-            self._store[key] = (str(value), now + ttl if ttl else float("inf"))
+            self._store[key] = (str(value), (now + ttl) if ttl else float("inf"))
             return True
 
     def get(self, key):

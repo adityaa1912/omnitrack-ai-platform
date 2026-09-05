@@ -66,6 +66,7 @@ class StreamLease:
         self._on_lost = on_lost
         self._lock = threading.Lock()
         self._last_heartbeat_ok = False
+        self._last_renewed_at: Optional[float] = None
         self._lost = False
 
     @property
@@ -104,7 +105,8 @@ class StreamLease:
             try:
                 acquired = bool(
                     self._client.set(
-                        self._key, token, nx=True, ex=int(self._ttl_seconds)
+                        self._key, token, nx=True,
+                        px=max(int(self._ttl_seconds * 1000), 1)
                     )
                 )
             except redis.RedisError as exc:
@@ -116,6 +118,7 @@ class StreamLease:
                 with self._lock:
                     self._lost = False
                     self._last_heartbeat_ok = True
+                    self._last_renewed_at = time.monotonic()
                 LEASE_ACQUISITIONS_TOTAL.labels(outcome="acquired").inc()
                 return True
             if time.monotonic() >= deadline:
@@ -179,18 +182,28 @@ class StreamLease:
         except redis.RedisError as exc:
             with self._lock:
                 self._last_heartbeat_ok = False
+                stale_for = self._stale_for_locked()
             LEASE_HEARTBEATS_TOTAL.labels(outcome="redis_error").inc()
             logger.warning(
                 f"Redis error renewing lease for {self.stream_id}: {exc}"
             )
+            if stale_for >= self._ttl_seconds:
+                self._mark_lost("renewal outage exceeded ttl")
             return False
         with self._lock:
             self._last_heartbeat_ok = renewed
+            if renewed:
+                self._last_renewed_at = time.monotonic()
         if renewed:
             LEASE_HEARTBEATS_TOTAL.labels(outcome="renewed").inc()
         else:
             self._mark_lost("renewal failed")
         return renewed
+
+    def _stale_for_locked(self) -> float:
+        if self._last_renewed_at is None:
+            return 0.0
+        return time.monotonic() - self._last_renewed_at
 
     def _is_lost(self) -> bool:
         with self._lock:
@@ -218,7 +231,8 @@ class LeaderLease:
         try:
             return bool(
                 self._client.set(
-                    self._key, self._instance_id, nx=True, ex=int(self._ttl_seconds)
+                    self._key, self._instance_id, nx=True,
+                    px=max(int(self._ttl_seconds * 1000), 1)
                 )
             )
         except redis.RedisError as exc:
@@ -328,12 +342,23 @@ class LeaseManager:
         with self._lock:
             self._ensure_thread_locked()
 
-    def stop(self, grace_seconds: float = 5.0) -> int:
-        """Stop the heartbeat thread and release every lease."""
+    def stop_heartbeats(self, grace_seconds: float = 5.0) -> None:
+        """Stop the heartbeat thread WITHOUT releasing any lease.
+
+        Used at graceful shutdown: heartbeats stop (so a dying pod stops
+        fighting for its leases) while the leases themselves stay held until
+        every stream's inference thread has joined, preventing a takeover
+        racing still-running local work. The leases are then either released
+        explicitly or expire by TTL.
+        """
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=grace_seconds)
+
+    def stop(self, grace_seconds: float = 5.0) -> int:
+        """Stop the heartbeat thread and release every lease."""
+        self.stop_heartbeats(grace_seconds)
         return self.release_all()
 
     def _ensure_thread_locked(self) -> None:

@@ -308,3 +308,162 @@ class TestShutdown:
         assert thread is not None and thread.is_alive()
         m.stop(grace_seconds=2)
         assert not thread.is_alive()
+
+
+class TestRedisOutage:
+    def test_acquire_outage_refuses_start_not_owns_stream(self):
+        client = FakeRedis()
+        service = InferenceService(db_path="sqlite://")
+        m = _manager(client, "r1")
+        service.set_lease_manager(m)
+        client.fail_mode = True
+        with pytest.raises(ValueError, match="Redis unavailable"):
+            service.start_stream(StreamConfig(stream_id="cam-outage", source=0))
+        client.fail_mode = False
+        assert service.has_stream("cam-outage") is False
+
+    def test_outage_then_recovery_heartbeat_resumes(self):
+        client = FakeRedis()
+        m = _manager(client, "r1")
+        m.acquire("s")
+        client.fail_mode = True
+        assert m.heartbeat_all() == 0
+        assert m.leases["s"].last_heartbeat_ok is False
+        client.fail_mode = False
+        assert m.heartbeat_all() == 1
+        assert m.owner_of("s") == "r1"
+
+    def test_outage_longer_than_ttl_marks_lease_lost(self):
+        client = FakeRedis()
+        lost = []
+        m = LeaseManager(
+            client,
+            instance_id="r1",
+            ttl_seconds=0.5,
+            heartbeat_interval_seconds=0.05,
+            acquire_timeout_seconds=0.0,
+            on_lost=lost.append,
+        )
+        m.acquire("s")
+        client.fail_mode = True
+        time.sleep(0.7)
+        assert m.heartbeat_all() == 0
+        assert lost == ["s"]
+        client.fail_mode = False
+        assert m.acquire("s") is not None
+
+    def test_short_outage_does_not_mark_lost(self):
+        client = FakeRedis()
+        lost = []
+        m = LeaseManager(
+            client,
+            instance_id="r1",
+            ttl_seconds=5.0,
+            heartbeat_interval_seconds=0.05,
+            acquire_timeout_seconds=0.0,
+            on_lost=lost.append,
+        )
+        m.acquire("s")
+        client.fail_mode = True
+        m.heartbeat_all()
+        client.fail_mode = False
+        assert lost == []
+        assert m.heartbeat_all() == 1
+
+
+class TestExpiryRace:
+    def test_expired_owner_cannot_renew(self):
+        clock = FakeClock()
+        client = FakeRedis(clock=clock)
+        m = _manager(client, "r1", ttl_seconds=5)
+        m.acquire("s")
+        clock.advance(6)
+        client.set("omnitrack:lease:s", "r2", ex=60)
+        assert m.heartbeat_all() == 0
+        assert client.get("omnitrack:lease:s") == "r2"
+
+    def test_stale_owner_cannot_reacquire_locally(self):
+        client = FakeRedis()
+        lost = []
+        m = LeaseManager(
+            client,
+            instance_id="r1",
+            ttl_seconds=15.0,
+            heartbeat_interval_seconds=5.0,
+            acquire_timeout_seconds=0.0,
+            on_lost=lost.append,
+        )
+        m.acquire("s")
+        client.set("omnitrack:lease:s", "r2", ex=60)
+        m.heartbeat_all()
+        assert lost == ["s"]
+        assert m.acquire("s") is None or m.leases.get("s") is None
+
+    def test_takeover_during_expiry_window_single_winner(self):
+        clock = FakeClock()
+        client = FakeRedis(clock=clock)
+        m1 = _manager(client, "r1", ttl_seconds=5)
+        m1.acquire("s")
+        clock.advance(6)
+        m2 = _manager(client, "r2")
+        m3 = _manager(client, "r3")
+        assert (m2.acquire("s") is not None) ^ (m3.acquire("s") is not None)
+        assert m1.heartbeat_all() == 0
+
+
+class TestStaleOwnerPrevention:
+    def test_on_lost_invoked_once_and_stream_stopped(self):
+        client = FakeRedis()
+        stopped = []
+        m = LeaseManager(
+            client,
+            instance_id="r1",
+            ttl_seconds=15.0,
+            heartbeat_interval_seconds=5.0,
+            acquire_timeout_seconds=0.0,
+            on_lost=stopped.append,
+        )
+        m.acquire("cam")
+        client.set("omnitrack:lease:cam", "r2", ex=60)
+        m.heartbeat_all()
+        m.heartbeat_all()
+        assert stopped == ["cam"]
+
+    def test_reassignment_after_owner_death(self):
+        clock = FakeClock()
+        client = FakeRedis(clock=clock)
+        m1 = _manager(client, "dead-pod", ttl_seconds=3)
+        m1.acquire("cam")
+        clock.advance(4)
+        m2 = _manager(client, "new-pod")
+        lease = m2.acquire("cam")
+        assert lease is not None
+        assert lease.owner == "new-pod"
+        assert m1.heartbeat_all() == 0
+
+
+class TestGracefulShutdown:
+    def test_stop_heartbeats_keeps_lease_held(self):
+        client = FakeRedis()
+        m = _manager(client, "r1")
+        m.acquire("s")
+        m.stop_heartbeats(grace_seconds=1)
+        assert m.owner_of("s") == "r1"
+
+    def test_shutdown_releases_after_streams_stop(self):
+        client = FakeRedis()
+        service = InferenceService(db_path="sqlite://")
+        m = _manager(client, "r1")
+        service.set_lease_manager(m)
+        service.shutdown()
+        assert m.owner_of("s") is None
+        assert not m._leases
+
+    def test_lease_survives_shutdown_of_other_replica(self):
+        client = FakeRedis()
+        m1 = _manager(client, "r1")
+        m2 = _manager(client, "r2")
+        m1.acquire("s")
+        m2.acquire("t")
+        m2.stop_heartbeats(grace_seconds=1)
+        assert m1.owner_of("s") == "r1"

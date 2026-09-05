@@ -8,6 +8,7 @@ Provides WebSocket for real-time frame streaming.
 import asyncio
 import hmac
 import logging
+import threading
 import time
 import base64
 import cv2
@@ -224,6 +225,33 @@ lease_manager = None
 distributed_enabled = bool(
     getattr(settings, "distributed_enabled", False)
 ) and redis_client is not None
+
+
+def _handle_lease_lost(stream_id: str) -> None:
+    """Stop a stream whose lease this replica just lost.
+
+    Runs on the heartbeat thread via the lease manager's on_lost callback.
+    Never blocks it: stop_stream joins the inference thread, so the actual
+    stop is dispatched to a short-lived worker thread.
+    """
+    stream_websockets.close_stream(stream_id)
+    _stream_start_times.pop(stream_id, None)
+
+    def _stop():
+        try:
+            service.stop_stream(stream_id)
+        except ValueError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - loss handler must not raise
+            logger.error(
+                f"Error stopping stream {stream_id} after lease loss: {exc}"
+            )
+
+    threading.Thread(
+        target=_stop, name=f"lease-lost-{stream_id}", daemon=True
+    ).start()
+
+
 if distributed_enabled:
     lease_manager = LeaseManager(
         redis_client.client,
@@ -231,6 +259,7 @@ if distributed_enabled:
         ttl_seconds=settings.lease_ttl_seconds,
         heartbeat_interval_seconds=settings.lease_heartbeat_interval_seconds,
         acquire_timeout_seconds=settings.lease_acquire_timeout_seconds,
+        on_lost=_handle_lease_lost,
     )
     lease_manager.start()
     service.set_lease_manager(lease_manager)

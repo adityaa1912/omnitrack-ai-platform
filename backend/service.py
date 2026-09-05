@@ -1056,10 +1056,20 @@ class InferenceService:
         # Distributed mode: acquire the Redis lease BEFORE any resource is
         # opened. Exactly one replica can hold it; losing the race here means
         # another replica already owns this stream, so we refuse to start.
+        # A Redis outage also refuses the start — the single-owner guarantee
+        # cannot be verified, so failing safe beats duplicate inference.
         if self._lease_manager is not None:
             lease = self._lease_manager.acquire(config.stream_id)
             if lease is None:
                 owner = self._lease_manager.owner_of(config.stream_id)
+                if owner is None:
+                    metrics.LEASE_ACQUISITIONS_TOTAL.labels(
+                        outcome="redis_unavailable"
+                    ).inc()
+                    raise ValueError(
+                        f"Cannot verify ownership of stream "
+                        f"{config.stream_id}: Redis unavailable"
+                    )
                 metrics.LEASE_ACQUISITIONS_TOTAL.labels(
                     outcome="duplicate_start_rejected"
                 ).inc()
@@ -1136,11 +1146,12 @@ class InferenceService:
             return
         self._is_shutdown = True
 
-        # Distributed mode: stop heartbeating first, then release every lease
-        # as each stream stops, so a graceful pod termination hands streams
-        # over instead of leaving them to expire.
+        # Distributed mode: stop heartbeating FIRST but do not release the
+        # leases yet — a released lease invites takeover while inference is
+        # still running. Leases are released after every stream has stopped
+        # (or simply expire by TTL if this process dies mid-shutdown).
         if self._lease_manager is not None:
-            self._lease_manager.stop(
+            self._lease_manager.stop_heartbeats(
                 grace_seconds=get_settings().graceful_shutdown_timeout_seconds
             )
 
@@ -1156,6 +1167,12 @@ class InferenceService:
                 )
                 if self._lease_manager is not None:
                     self._lease_manager.release(stream_id)
+
+        # Every stream is stopped; now hand the streams over by releasing
+        # their leases so a takeover starts immediately instead of waiting
+        # for TTL expiry.
+        if self._lease_manager is not None:
+            self._lease_manager.release_all()
 
         # Stop the shared worker pool (if it was ever built) after every stream's
         # capture thread has been stopped, so no worker is processing a stream.
