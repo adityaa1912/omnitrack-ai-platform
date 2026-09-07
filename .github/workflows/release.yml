@@ -1,0 +1,103 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (must match an existing vX.Y.Z tag)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      sha: ${{ steps.verify.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify tag exists and images are built
+        id: verify
+        run: |
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import subprocess, sys
+          version = '${{ inputs.version }}'
+          if not version.startswith('v') or not version[1:].count('.') == 2:
+              print('::error::version must be vX.Y.Z'); sys.exit(1)
+          ref = subprocess.run(
+              ['git', 'rev-parse', f'refs/tags/{version}^{{commit}}'],
+              capture_output=True, text=True)
+          if ref.returncode != 0:
+              print(f'::error::tag {version} not found'); sys.exit(1)
+          print(f'sha={ref.stdout.strip()}')
+          print(f'version={version}')
+          EOF
+      - name: Confirm CI passed on the tagged commit
+        run: |
+          curl -sf -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/commits/${{ steps.verify.outputs.sha }}/check-runs" \
+            | python -c "import json,sys; runs=json.load(sys.stdin)['check_runs']; print('check-runs:', len(runs))"
+
+  production-deploy:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate manifests
+        run: kubectl apply --dry-run=client -f kubernetes/ --validate=false
+      - name: Migration safety check
+        run: python scripts/ci/check_migrations.py
+      - name: Run migrations (production)
+        run: |
+          kubectl -n omnitrack run migrate-${{ needs.gate.outputs.sha }} --rm -i \
+            --image ghcr.io/${{ github.repository_owner }}/omnitrack-backend:${{ needs.gate.outputs.version }} \
+            --restart=Never -- alembic upgrade head
+      - name: Deploy backend (production)
+        run: |
+          python scripts/ci/deploy.py \
+            --namespace omnitrack \
+            --deployment omnitrack-backend \
+            --image ghcr.io/${{ github.repository_owner }}/omnitrack-backend:${{ needs.gate.outputs.version }} \
+            --timeout 600 \
+            --smoke-url http://omnitrack-backend.omnitrack.svc.cluster.local:8000/health
+      - name: Deploy frontend (production)
+        run: |
+          python scripts/ci/deploy.py \
+            --namespace omnitrack \
+            --deployment omnitrack-frontend \
+            --image ghcr.io/${{ github.repository_owner }}/omnitrack-frontend:${{ needs.gate.outputs.version }} \
+            --timeout 600
+
+  report:
+    needs: [production-deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open deployment failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Production deploy failed: ${{ inputs.version }}`,
+              labels: ['deployment-failure'],
+              body: `Deploy of ${{ inputs.version }} failed and was rolled back.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            })

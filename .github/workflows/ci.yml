@@ -1,0 +1,141 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OMNITRACK_JWT_SECRET: ci-only-not-a-real-secret-0123456789
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ruff==0.6.9
+      - run: ruff check --select E9,F63,F7,F82 backend inference scripts tests
+      - run: python scripts/ci/check_migrations.py
+      - name: YAML syntax
+        run: |
+          pip install pyyaml
+          python - <<'EOF'
+          import glob, sys, yaml
+          bad = 0
+          for f in glob.glob('kubernetes/*.yaml') + glob.glob('.github/workflows/*.yml'):
+              try:
+                  list(yaml.safe_load_all(open(f, encoding='utf-8')))
+              except yaml.YAMLError as e:
+                  print(f'{f}: {e}'); bad += 1
+          sys.exit(1 if bad else 0)
+          EOF
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: AST / import validation
+        run: |
+          python - <<'EOF'
+          import ast, glob, sys
+          for f in glob.glob('backend/**/*.py', recursive=True) + glob.glob('inference/**/*.py', recursive=True):
+              ast.parse(open(f, encoding='utf-8').read(), f)
+          import backend.main
+          print('imports OK')
+          EOF
+      - run: python -m pytest tests/ -q
+        env:
+          OMNITRACK_JWT_SECRET: ci-only-not-a-real-secret-0123456789
+
+  migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Upgrade check on a fresh SQLite database
+        run: |
+          alembic upgrade head
+          alembic check
+        env:
+          OMNITRACK_SQLITE_PATH: /tmp/ci-migrations.db
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Deterministic install check
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip check
+      - name: Lockfile consistency
+        run: |
+          pip freeze --exclude-editable > /tmp/frozen.txt
+          python - <<'EOF'
+          import sys
+          want = {l.strip() for l in open('requirements.txt') if l.strip() and not l.startswith('#')}
+          got = {l.split('==')[0].lower() for l in open('/tmp/frozen.txt')}
+          missing = [w.split('==')[0].lower() for w in want if w.split('==')[0].lower() not in got]
+          if missing:
+              print(f'requirements.txt entries not installed: {missing}')
+              sys.exit(1)
+          print('dependency consistency OK')
+          EOF
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret detection
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Dependency vulnerability scan
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: requirements.txt requirements-dev.txt

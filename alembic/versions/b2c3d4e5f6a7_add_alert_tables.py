@@ -25,7 +25,7 @@ def upgrade() -> None:
         sa.Column("conditions", sa.JSON(), nullable=False),
         sa.Column("condition_logic", sa.String(length=8), nullable=False, default="AND"),
         sa.Column("severity", sa.String(length=32), nullable=False, default="warning"),
-        sa.Column("priority", sa.Integer(), nullable=False, default=0, index=True),
+        sa.Column("priority", sa.Integer(), nullable=False, default=0),
         sa.Column("cooldown_seconds", sa.Integer(), nullable=False, default=60),
         sa.Column("dedup_key_template", sa.String(length=255), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),

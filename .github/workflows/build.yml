@@ -1,0 +1,139 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  backend-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      backend-tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute image tags
+        id: meta
+        run: |
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import sys
+          sys.path.insert(0, 'scripts/ci')
+          from release_utils import compute_image_tags
+          tags = compute_image_tags('${{ github.ref }}', '${{ github.sha }}')
+          name = '${{ env.REGISTRY }}/${{ env.OWNER }}/omnitrack-backend'.lower()
+          print('tags=' + ','.join(f'{name}:{t}' for t in tags))
+          print('name=' + name)
+          EOF
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Scan pushed image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.name }}:sha-${{ github.sha }}
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
+
+  frontend-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      frontend-tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute image tags
+        id: meta
+        run: |
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import sys
+          sys.path.insert(0, 'scripts/ci')
+          from release_utils import compute_image_tags
+          tags = compute_image_tags('${{ github.ref }}', '${{ github.sha }}')
+          name = '${{ env.REGISTRY }}/${{ env.OWNER }}/omnitrack-frontend'.lower()
+          print('tags=' + ','.join(f'{name}:{t}' for t in tags))
+          print('name=' + name)
+          EOF
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.frontend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+          build-args: |
+            VITE_API_BASE_URL=/api
+            VITE_WS_BASE_URL=/ws
+      - name: Scan pushed image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.name }}:sha-${{ github.sha }}
+          severity: CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
+
+  staging-deploy:
+    needs: [backend-image, frontend-image]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate manifests
+        run: kubectl apply --dry-run=client -f kubernetes/ --validate=false
+      - name: Run migrations (staging)
+        run: |
+          kubectl -n omnitrack-staging run migrate-${{ github.sha }} --rm -i \
+            --image ghcr.io/${{ env.OWNER }}/omnitrack-backend:sha-${{ github.sha }} \
+            --restart=Never -- alembic upgrade head
+        env:
+          OWNER: ${{ github.repository_owner }}
+      - name: Deploy backend (staging)
+        run: |
+          python scripts/ci/deploy.py \
+            --namespace omnitrack-staging \
+            --deployment omnitrack-backend \
+            --image ghcr.io/${{ github.repository_owner }}/omnitrack-backend:sha-${{ github.sha }} \
+            --smoke-url http://omnitrack-backend.omnitrack-staging.svc.cluster.local:8000/health
+      - name: Deploy frontend (staging)
+        run: |
+          python scripts/ci/deploy.py \
+            --namespace omnitrack-staging \
+            --deployment omnitrack-frontend \
+            --image ghcr.io/${{ github.repository_owner }}/omnitrack-frontend:sha-${{ github.sha }}

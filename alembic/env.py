@@ -23,6 +23,8 @@ from alembic import context
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.models import Base  # noqa: E402
+import backend.alerts.models  # noqa: E402
+import backend.recording.models  # noqa: E402
 
 config = context.config
 

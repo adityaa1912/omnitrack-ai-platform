@@ -20,7 +20,11 @@ from ..cache.json_cache import JsonCache
 from ..models import Base
 from .aggregator import AnalyticsAggregator
 from .cache import AnalyticsCache
-from backend.observability.metrics import ANALYTICS_QUERY_LATENCY
+from backend.observability.metrics import (
+    ANALYTICS_CACHE_HITS_TOTAL,
+    ANALYTICS_CACHE_MISSES_TOTAL,
+    ANALYTICS_QUERY_LATENCY,
+)
 from .models import AnalyticsSummary, LineCrossing, TrajectorySnapshot, ZoneOccupancy
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
