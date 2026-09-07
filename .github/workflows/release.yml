@@ -26,14 +26,16 @@ jobs:
           python-version: "3.11"
       - name: Verify tag exists and images are built
         id: verify
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          if ! [[ '${{ inputs.version }}' =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::version must be vX.Y.Z"
             exit 1
           fi
           python - <<'EOF' >> "$GITHUB_OUTPUT"
-          import subprocess, sys
-          version = '${{ inputs.version }}'
+          import os, subprocess, sys
+          version = os.environ['VERSION']
           if not version.startswith('v') or not version[1:].count('.') == 2:
               print('::error::version must be vX.Y.Z'); sys.exit(1)
           ref = subprocess.run(
@@ -47,10 +49,12 @@ jobs:
       - name: Confirm CI passed on the tagged commit
         run: |
           curl -sf -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/commits/${{ steps.verify.outputs.sha }}/check-runs" \
-            | python - <<'EOF'
-          import json, sys
-          runs = json.load(sys.stdin)['check_runs']
+            > "$RUNNER_TEMP/check-runs.json"
+          python - <<'EOF'
+          import json, os
+          runs = json.load(open(os.environ['RUNNER_TEMP'] + '/check-runs.json'))['check_runs']
           if not runs:
               print('::error::no CI check-runs found for the tagged commit')
               sys.exit(1)
@@ -66,7 +70,6 @@ jobs:
     environment: production
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,12 +123,14 @@ jobs:
     steps:
       - name: Open deployment failure issue
         uses: actions/github-script@v7
+        env:
+          VERSION: ${{ inputs.version }}
         with:
           script: |
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `Production deploy failed: ${{ inputs.version }}`,
+              title: `Production deploy failed: ${process.env.VERSION}`,
               labels: ['deployment-failure'],
-              body: `Deploy of ${{ inputs.version }} failed and was rolled back.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+              body: `Deploy of ${process.env.VERSION} failed and was rolled back.\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             })
