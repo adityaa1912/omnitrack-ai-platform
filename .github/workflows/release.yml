@@ -27,6 +27,10 @@ jobs:
       - name: Verify tag exists and images are built
         id: verify
         run: |
+          if ! [[ '${{ inputs.version }}' =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must be vX.Y.Z"
+            exit 1
+          fi
           python - <<'EOF' >> "$GITHUB_OUTPUT"
           import subprocess, sys
           version = '${{ inputs.version }}'
@@ -44,7 +48,17 @@ jobs:
         run: |
           curl -sf -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/commits/${{ steps.verify.outputs.sha }}/check-runs" \
-            | python -c "import json,sys; runs=json.load(sys.stdin)['check_runs']; print('check-runs:', len(runs))"
+            | python - <<'EOF'
+          import json, sys
+          runs = json.load(sys.stdin)['check_runs']
+          if not runs:
+              print('::error::no CI check-runs found for the tagged commit')
+              sys.exit(1)
+          if not any(r.get('conclusion') == 'success' for r in runs):
+              print('::error::no successful CI check-run for the tagged commit')
+              sys.exit(1)
+          print('check-runs:', len(runs))
+          EOF
 
   production-deploy:
     needs: gate
@@ -55,36 +69,50 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Configure cluster access
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
       - name: Validate manifests
         run: kubectl apply --dry-run=client -f kubernetes/ --validate=false
       - name: Migration safety check
         run: python scripts/ci/check_migrations.py
       - name: Run migrations (production)
         run: |
+          image="ghcr.io/${{ github.repository_owner }}/omnitrack-backend:${{ needs.gate.outputs.version }}"
+          image="${image,,}"
           kubectl -n omnitrack run migrate-${{ needs.gate.outputs.sha }} --rm -i \
-            --image ghcr.io/${{ github.repository_owner }}/omnitrack-backend:${{ needs.gate.outputs.version }} \
+            --image "$image" \
             --restart=Never -- alembic upgrade head
       - name: Deploy backend (production)
         run: |
+          image="ghcr.io/${{ github.repository_owner }}/omnitrack-backend:${{ needs.gate.outputs.version }}"
+          image="${image,,}"
           python scripts/ci/deploy.py \
             --namespace omnitrack \
             --deployment omnitrack-backend \
-            --image ghcr.io/${{ github.repository_owner }}/omnitrack-backend:${{ needs.gate.outputs.version }} \
+            --container backend \
+            --image "$image" \
             --timeout 600 \
             --smoke-url http://omnitrack-backend.omnitrack.svc.cluster.local:8000/health
       - name: Deploy frontend (production)
         run: |
+          image="ghcr.io/${{ github.repository_owner }}/omnitrack-frontend:${{ needs.gate.outputs.version }}"
+          image="${image,,}"
           python scripts/ci/deploy.py \
             --namespace omnitrack \
             --deployment omnitrack-frontend \
-            --image ghcr.io/${{ github.repository_owner }}/omnitrack-frontend:${{ needs.gate.outputs.version }} \
+            --container frontend \
+            --image "$image" \
             --timeout 600
 
   report:
-    needs: [production-deploy]
+    needs: [gate, production-deploy]
     if: failure()
     runs-on: ubuntu-latest
     permissions:

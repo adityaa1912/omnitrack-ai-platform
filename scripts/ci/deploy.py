@@ -94,6 +94,7 @@ def deploy(
     image: str | None,
     timeout: int,
     smoke_url: str | None,
+    container: str | None = None,
 ) -> dict:
     record: dict = {"deployment": deployment, "namespace": namespace}
     if image is not None:
@@ -102,7 +103,7 @@ def deploy(
                 "set",
                 "image",
                 f"deployment/{deployment}",
-                f"{deployment}={image}",
+                f"{container or deployment}={image}",
                 f"--namespace={namespace}",
             ]
         )
@@ -132,6 +133,7 @@ def main() -> int:
     parser.add_argument("--image", default=None)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--smoke-url", default=None)
+    parser.add_argument("--container", default=None)
     args = parser.parse_args()
     try:
         record = deploy(
@@ -140,6 +142,7 @@ def main() -> int:
             args.image,
             args.timeout,
             args.smoke_url,
+            args.container,
         )
     except DeployError as exc:
         print(f"DEPLOY FAILED (rolled back): {exc}")

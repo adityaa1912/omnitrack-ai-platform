@@ -115,25 +115,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Configure cluster access
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
       - name: Validate manifests
         run: kubectl apply --dry-run=client -f kubernetes/ --validate=false
       - name: Run migrations (staging)
         run: |
+          image="ghcr.io/${{ github.repository_owner }}/omnitrack-backend:sha-${{ github.sha }}"
+          image="${image,,}"
           kubectl -n omnitrack-staging run migrate-${{ github.sha }} --rm -i \
-            --image ghcr.io/${{ env.OWNER }}/omnitrack-backend:sha-${{ github.sha }} \
+            --image "$image" \
             --restart=Never -- alembic upgrade head
-        env:
-          OWNER: ${{ github.repository_owner }}
       - name: Deploy backend (staging)
         run: |
+          image="ghcr.io/${{ github.repository_owner }}/omnitrack-backend:sha-${{ github.sha }}"
+          image="${image,,}"
           python scripts/ci/deploy.py \
             --namespace omnitrack-staging \
             --deployment omnitrack-backend \
-            --image ghcr.io/${{ github.repository_owner }}/omnitrack-backend:sha-${{ github.sha }} \
+            --container backend \
+            --image "$image" \
             --smoke-url http://omnitrack-backend.omnitrack-staging.svc.cluster.local:8000/health
       - name: Deploy frontend (staging)
         run: |
+          image="ghcr.io/${{ github.repository_owner }}/omnitrack-frontend:sha-${{ github.sha }}"
+          image="${image,,}"
           python scripts/ci/deploy.py \
             --namespace omnitrack-staging \
             --deployment omnitrack-frontend \
-            --image ghcr.io/${{ github.repository_owner }}/omnitrack-frontend:sha-${{ github.sha }}
+            --container frontend \
+            --image "$image"

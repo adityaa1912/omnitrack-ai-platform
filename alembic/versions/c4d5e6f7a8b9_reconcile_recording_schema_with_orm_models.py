@@ -29,8 +29,10 @@ def upgrade() -> None:
     op.create_index('ix_evidences_recording_id', 'evidences', ['recording_id'])
     op.create_index('ix_event_recording_links_event_id', 'event_recording_links', ['event_id'])
     op.create_index('ix_event_recording_links_recording_id', 'event_recording_links', ['recording_id'])
+    op.execute("UPDATE snapshots SET file_path = '' WHERE file_path IS NULL")
     with op.batch_alter_table('snapshots') as batch_op:
         batch_op.alter_column('file_path', existing_type=sa.String(), nullable=False)
+    op.execute("UPDATE evidences SET file_path = '' WHERE file_path IS NULL")
     with op.batch_alter_table('evidences') as batch_op:
         batch_op.alter_column('file_path', existing_type=sa.String(), nullable=False)
 

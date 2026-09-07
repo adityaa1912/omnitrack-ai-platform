@@ -284,6 +284,21 @@ class TestDeploySmoke:
         assert record["rollout"] == "ok"
         assert rolled_back == []
 
+    def test_deploy_uses_container_name_not_deployment(self, monkeypatch):
+        import deploy as dp
+
+        commands = []
+        monkeypatch.setattr(
+            dp,
+            "_kubectl",
+            lambda args, timeout=60: commands.append(args) or "",
+        )
+        monkeypatch.setattr(dp, "rollout_status", lambda d, n, t: None)
+        dp.deploy("omnitrack-backend", "ns", "img:1", 60, None, container="backend")
+        set_image = [c for c in commands if c[:2] == ["set", "image"]][0]
+        assert "backend=img:1" in set_image
+        assert "omnitrack-backend=img:1" not in set_image
+
     def test_deploy_error_includes_kubectl_stderr(self):
         assert "kubectl" in str(
             __import__("deploy").DeployError("kubectl get failed: boom")
