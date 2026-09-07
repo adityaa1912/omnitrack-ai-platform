@@ -51,7 +51,7 @@ def list_recordings(
         return result
     except Exception as exc:
         om.API_REQUEST_ERRORS_TOTAL.inc()
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="Failed to list recordings")
 
 
 @router.get("/{recording_id}")

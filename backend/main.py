@@ -878,6 +878,23 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Convert unhandled exceptions into a stable, detail-free 500 envelope.
+
+    The traceback is logged server-side (with the request's correlation id
+    bound by the observability middleware); the client only ever sees the
+    generic message, so internal paths, SQL, and provider errors never leak.
+    Deliberately raised HTTPExceptions and request validation keep their own
+    status codes and FastAPI ``detail`` payloads.
+    """
+    logger.error(
+        f"Unhandled exception: {request.method} {request.url.path}",
+        exc_info=exc,
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
 # ============================================================================
 # Database session dependency for FastAPI (handled by auth dependencies)
 # ============================================================================
@@ -1437,8 +1454,8 @@ async def stop_stream(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"Failed to stop stream: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to stop stream: {e}", exc_info=e)
+        raise HTTPException(status_code=500, detail="Failed to stop stream")
 
 
 @app.get("/stream/{stream_id}/metrics", response_model=MetricsResponse)
