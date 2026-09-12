@@ -1004,6 +1004,8 @@ class InferenceService:
 
     def start_stream(self, config: StreamConfig) -> StreamMetrics:
         """Start a new inference stream."""
+        if self._is_shutdown:
+            raise RuntimeError("Inference service is shutting down")
         # Drop any finished streams first, so a completed run does not block
         # reusing its stream_id.
         self.reap_finished()

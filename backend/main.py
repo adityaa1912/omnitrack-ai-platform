@@ -7,6 +7,7 @@ Provides WebSocket for real-time frame streaming.
 
 import asyncio
 import hmac
+import inspect
 import logging
 import threading
 import time
@@ -747,6 +748,15 @@ async def _close_stopped_stream_socket(websocket: WebSocket) -> None:
         await websocket.close(code=1000, reason="stream stopped")
 
 
+async def _shutdown_step(name: str, fn) -> None:
+    try:
+        result = fn()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 - one failed step must not skip the rest
+        logger.error(f"Shutdown step '{name}' failed", exc_info=exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """
@@ -795,26 +805,31 @@ async def lifespan(_app: FastAPI):
         yield
     finally:
         logger.info("Application shutdown: stopping streams and disposing resources")
-        stream_websockets.close_all()
-        supervisor.stop()
-        await asyncio.to_thread(service.shutdown)
+        await _shutdown_step("websockets", stream_websockets.close_all)
+        await _shutdown_step("supervisor", supervisor.stop)
+        await _shutdown_step("streams", lambda: asyncio.to_thread(service.shutdown))
         if alert_engine is not None:
-            await asyncio.to_thread(alert_engine.stop)
+            await _shutdown_step("alert_engine", lambda: asyncio.to_thread(alert_engine.stop))
         if alert_manager is not None:
-            await asyncio.to_thread(alert_manager.stop)
+            await _shutdown_step("alert_manager", lambda: asyncio.to_thread(alert_manager.stop))
+        if analytics_aggregator is not None:
+            await _shutdown_step("analytics_aggregator", lambda: asyncio.to_thread(analytics_aggregator.stop))
         if lease_manager is not None:
-            lease_manager.stop(
-                grace_seconds=min(
-                    settings.graceful_shutdown_timeout_seconds, 5.0
-                )
+            await _shutdown_step(
+                "lease_manager",
+                lambda: lease_manager.stop(
+                    grace_seconds=min(
+                        settings.graceful_shutdown_timeout_seconds, 5.0
+                    )
+                ),
             )
-        shutdown_frame_pool()
+        await _shutdown_step("frame_pool", shutdown_frame_pool)
         if redis_client is not None:
-            redis_client.close()
+            await _shutdown_step("redis", redis_client.close)
         if kafka_producer is not None:
-            await asyncio.to_thread(kafka_producer.close)
-        system_sampler.stop()
-        shutdown_logging()
+            await _shutdown_step("kafka_producer", lambda: asyncio.to_thread(kafka_producer.close))
+        await _shutdown_step("system_sampler", system_sampler.stop)
+        await _shutdown_step("logging", shutdown_logging)
 
 
 # Create FastAPI app
