@@ -121,7 +121,7 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None, model_manager=None) -> None:
+    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None, model_manager=None, on_finished: Optional[Callable[["InferenceStream"], None]] = None) -> None:
         self.config = config
         # Thread-safe session registry (scoped_session). Each thread that writes
         # obtains its OWN session via `self._session_factory()` and releases it
@@ -161,6 +161,7 @@ class InferenceStream:
         # State
         self.is_running = False
         self.thread: Optional[threading.Thread] = None
+        self._on_finished = on_finished
 
         # Metrics
         self.metrics = StreamMetrics(stream_id=config.stream_id)
@@ -436,6 +437,13 @@ class InferenceStream:
             self._session_factory.remove()
             self.is_running = False
             self._cleanup()
+            if self._on_finished is not None:
+                try:
+                    self._on_finished(self)
+                except Exception as exc:  # noqa: BLE001 - callback must not break cleanup
+                    logger.error(
+                        f"on_finished callback failed for {self.config.stream_id}: {exc}"
+                    )
             correlation.clear_stream_context()
             logger.info(f"Inference loop finished for {self.config.stream_id}")
 
@@ -495,6 +503,13 @@ class InferenceStream:
             if self._scheduler is not None:
                 self._scheduler.unregister(self.config.stream_id)
             self._cleanup()
+            if self._on_finished is not None:
+                try:
+                    self._on_finished(self)
+                except Exception as exc:  # noqa: BLE001 - callback must not break cleanup
+                    logger.error(
+                        f"on_finished callback failed for {self.config.stream_id}: {exc}"
+                    )
             correlation.clear_stream_context()
             logger.info(f"Capture loop finished for {self.config.stream_id}")
 
@@ -1020,6 +1035,7 @@ class InferenceService:
             scheduler=self._get_scheduler(),
             batch_manager=self._get_batch_manager(),
             model_manager=self._get_model_manager(),
+            on_finished=self._handle_stream_finished,
         )
         # Subscribe the derived-event publisher (Kafka bus) to this stream's
         # buffer. Guarded so a misbehaving publisher can never block a start.
@@ -1115,6 +1131,21 @@ class InferenceService:
                 metrics.ACTIVE_STREAMS.set(len(self.streams))
             metrics.STREAMS_STOPPED_TOTAL.inc()
 
+    def _handle_stream_finished(self, stream: InferenceStream) -> None:
+        stream_id = stream.config.stream_id
+        with self._streams_lock:
+            if stream_id in self._stopping:
+                return
+            if self.streams.get(stream_id) is not stream:
+                return
+            self.streams.pop(stream_id, None)
+            metrics.ACTIVE_STREAMS.set(len(self.streams))
+            if self._lease_manager is not None:
+                if self._lease_manager.release(stream_id):
+                    metrics.LEASE_OWNED_STREAMS.set(
+                        len(self._lease_manager.leases)
+                    )
+
     def has_stream(self, stream_id: str) -> bool:
         """Return whether ``stream_id`` is still registered as live."""
         with self._streams_lock:
@@ -1201,14 +1232,18 @@ class InferenceService:
 
     def get_stream_metrics(self, stream_id: str) -> StreamMetrics:
         """Get metrics for a specific stream."""
-        if stream_id not in self.streams:
+        with self._streams_lock:
+            stream = self.streams.get(stream_id)
+        if stream is None:
             raise ValueError(f"Stream {stream_id} not found")
 
-        return self.streams[stream_id].get_metrics()
+        return stream.get_metrics()
 
     def list_streams(self) -> List[dict]:
         """List all active streams (finished ones are reaped first)."""
         self.reap_finished()
+        with self._streams_lock:
+            streams = list(self.streams.values())
         return [
             {
                 "stream_id": s.config.stream_id,
@@ -1216,7 +1251,7 @@ class InferenceService:
                 "is_running": s.is_running,
                 "metrics": s.get_metrics(),
             }
-            for s in self.streams.values()
+            for s in streams
         ]
 
     def reap_finished(self) -> int:
@@ -1229,9 +1264,10 @@ class InferenceService:
         can be reused. Its event history is intentionally retained in the
         EventStore, which outlives the live stream.
 
-        Must be called only from the request/event-loop thread — the sole
-        mutator of ``self.streams`` — so no lock is needed. The joined threads
-        are already ending, so the bounded join returns effectively immediately.
+        Safe to call from the request/event-loop thread. Worker threads also
+        mutate ``self.streams`` via the ``on_finished`` callback, so this
+        method takes the registry lock; the joined threads are already ending,
+        so the bounded join returns effectively immediately.
         """
         with self._streams_lock:
             finished = [
@@ -1251,17 +1287,21 @@ class InferenceService:
 
     def get_stream_detections(self, stream_id: str) -> List[Detection]:
         """Get latest detections from a stream."""
-        if stream_id not in self.streams:
+        with self._streams_lock:
+            stream = self.streams.get(stream_id)
+        if stream is None:
             raise ValueError(f"Stream {stream_id} not found")
 
-        return self.streams[stream_id].get_latest_detections()
+        return stream.get_latest_detections()
 
     def get_stream_frame(self, stream_id: str, timeout: float = 1.0) -> Optional[dict]:
         """Get next output frame from a stream."""
-        if stream_id not in self.streams:
+        with self._streams_lock:
+            stream = self.streams.get(stream_id)
+        if stream is None:
             raise ValueError(f"Stream {stream_id} not found")
 
-        return self.streams[stream_id].get_output_frame(timeout)
+        return stream.get_output_frame(timeout)
 
     def get_stream_events(
         self, stream_id: str, limit: Optional[int] = None
