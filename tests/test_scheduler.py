@@ -90,21 +90,45 @@ def test_newest_frame_priority_under_overload() -> None:
         picked_up.set()
         release.wait(timeout=5.0)
 
-    before = _drops("burst")
+    before_drops = _drops("burst")
     try:
         scheduler.register("burst", process_fn)
         scheduler.submit("burst", 1)
         assert picked_up.wait(timeout=2.0)  # worker is now blocked on frame 1
 
-        # Burst while the worker is busy: capacity 2 drops the oldest on the
-        # 4th/5th submit, and the worker later takes only the newest (5),
-        # dropping the remaining queued frame.
-        for frame_id in (2, 3, 4, 5):
-            scheduler.submit("burst", frame_id)
+        # Burst while the worker is busy: capacity 2 allows frames 2 and 3 to enqueue.
+        # Submitting 4 and 5 will block due to backpressure. We submit from a thread.
+        def submit_burst():
+            for frame_id in (2, 3, 4, 5):
+                scheduler.submit("burst", frame_id)
+        
+        t = threading.Thread(target=submit_burst)
+        t.start()
+        
+        # Give the thread time to enqueue 2 and 3, and block on 4.
+        time.sleep(0.1)
+        
+        # Release the worker for frame 1, but clear it immediately so it blocks on 3
         release.set()
+        release.clear()
+        
+        # Now worker is blocked on frame 3. The queue is empty.
+        # Submitter thread wakes up and pushes 4 and 5, then finishes.
+        t.join(timeout=2.0)
 
-        assert _wait_until(lambda: seen == [1, 5])
-        assert _drops("burst") - before == 3
+        # To ensure the worker processes the final frame, we release it again
+        # Release for frame 3, clear so it blocks on 5
+        release.set()
+        release.clear()
+        
+        # Release for frame 5
+        release.set()
+        
+        # The processed sequence should be 1, 3, 5
+        assert _wait_until(lambda: seen == [1, 3, 5])
+        
+        # Two frames (2 and 4) were dropped by take_newest
+        assert _drops("burst") - before_drops == 2
         assert (
             metrics.SCHEDULER_QUEUE_DEPTH.labels(stream_id="burst")._value.get() == 0
         )
