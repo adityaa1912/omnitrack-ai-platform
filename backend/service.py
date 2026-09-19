@@ -121,7 +121,7 @@ class StreamMetrics:
 class InferenceStream:
     """Manages a single inference stream (frame source → detector → tracker → visualizer)."""
 
-    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None, model_manager=None, on_finished: Optional[Callable[["InferenceStream"], None]] = None) -> None:
+    def __init__(self, config: StreamConfig, session_factory, event_buffer=None, scheduler=None, batch_manager=None, model_manager=None, recording_manager=None, on_finished: Optional[Callable[["InferenceStream"], None]] = None) -> None:
         self.config = config
         # Thread-safe session registry (scoped_session). Each thread that writes
         # obtains its OWN session via `self._session_factory()` and releases it
@@ -156,7 +156,7 @@ class InferenceStream:
 
         # Bounded in-memory event sink (ring buffer owned by the service).
         self.event_buffer = event_buffer
-        self.recording_manager = None
+        self.recording_manager = recording_manager
 
         # State
         self.is_running = False
@@ -181,12 +181,8 @@ class InferenceStream:
         try:
             self._initialize_components()
             self.is_running = True
-            # Initialize recording manager if enabled
-            if getattr(settings, "recording_enabled", False) and getattr(settings, "recording_storage_path", None):
-                from backend.recording.manager import RecordingManager
-                from backend.recording.storage import LocalFileStorageProvider
-                storage = LocalFileStorageProvider(settings.recording_storage_path)
-                self.recording_manager = RecordingManager(self._session_factory, storage, settings)
+            # Start recording for this stream if a manager was provided
+            if self.recording_manager is not None:
                 self.recording_manager.start_recording(self.config.stream_id)
             if self._scheduler is not None:
                 # Decoupled path: pin this stream to a scheduler worker and run a
@@ -908,6 +904,10 @@ class InferenceService:
         # the original un-leased behavior.
         self._lease_manager: Optional[LeaseManager] = None
         self._distributed = False
+        
+        # Optional process-wide recording manager
+        self._recording_manager = None
+        self._recording_manager_lock = threading.Lock()
 
     def set_lease_manager(self, lease_manager: Optional[LeaseManager]) -> None:
         """Register the distributed-mode lease manager (or clear it)."""
@@ -939,6 +939,18 @@ class InferenceService:
                     model_manager=self._get_model_manager(),
                 )
             return self._batch_manager
+
+    def _get_recording_manager(self):
+        """Return the lazy-built recording manager, or None when disabled."""
+        if not (getattr(settings, "recording_enabled", False) and getattr(settings, "recording_storage_path", None)):
+            return None
+        with self._recording_manager_lock:
+            if self._recording_manager is None:
+                from backend.recording.manager import RecordingManager
+                from backend.recording.storage import LocalFileStorageProvider
+                storage = LocalFileStorageProvider(settings.recording_storage_path)
+                self._recording_manager = RecordingManager(self.Session, storage, settings)
+            return self._recording_manager
 
     def _get_scheduler(self) -> Optional[InferenceScheduler]:
         """Return the lazy-built scheduler, or None when scheduling is disabled."""
@@ -1035,6 +1047,7 @@ class InferenceService:
             scheduler=self._get_scheduler(),
             batch_manager=self._get_batch_manager(),
             model_manager=self._get_model_manager(),
+            recording_manager=self._get_recording_manager(),
             on_finished=self._handle_stream_finished,
         )
         # Subscribe the derived-event publisher (Kafka bus) to this stream's
@@ -1206,6 +1219,9 @@ class InferenceService:
         # for TTL expiry.
         if self._lease_manager is not None:
             self._lease_manager.release_all()
+            
+        if getattr(self, "_recording_manager", None) is not None:
+            self._recording_manager.shutdown()
 
         # Stop the shared worker pool (if it was ever built) after every stream's
         # capture thread has been stopped, so no worker is processing a stream.

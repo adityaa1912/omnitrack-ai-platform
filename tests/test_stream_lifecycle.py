@@ -11,7 +11,7 @@ import backend.service
 from backend.service import InferenceService, StreamConfig, StreamMetrics
 from backend.ownership import LeaseManager
 
-from distributed_fake_redis import FakeRedis
+from tests.distributed_fake_redis import FakeRedis
 
 
 def _manager(client, instance_id, **kwargs):

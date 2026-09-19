@@ -6,7 +6,8 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
-from queue import Queue
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session, sessionmaker
 from backend.recording.models import Recording, Snapshot, Evidence, EventRecordingLink
@@ -31,8 +32,20 @@ class RecordingManager:
         self._settings = settings
         self._streams: Dict[str, "StreamRecorder"] = {}
         self._lock = threading.Lock()
+        
+        # Bounded shared worker pool for I/O operations (writing frames, encoding clips, taking snapshots)
+        max_workers = getattr(self._settings, "recording_max_workers", 4)
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rec_worker")
+        
+        self._is_shutdown = False
+        
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self._cleanup_thread.start()
+
+    def shutdown(self) -> None:
+        """Gracefully shut down the recording manager and its background workers."""
+        self._is_shutdown = True
+        self._executor.shutdown(wait=False)
 
     def start_recording(self, stream_id: str) -> None:
         with self._lock:
@@ -43,6 +56,7 @@ class RecordingManager:
                 db=self._db,
                 storage=self._storage,
                 settings=self._settings,
+                executor=self._executor,
             )
             recorder.start()
             self._streams[stream_id] = recorder
@@ -118,7 +132,7 @@ class RecordingManager:
             return False
 
     def _cleanup_loop(self) -> None:
-        while True:
+        while not self._is_shutdown:
             try:
                 self._cleanup()
             except Exception as exc:  # noqa: BLE001
@@ -128,6 +142,8 @@ class RecordingManager:
             except AttributeError:
                 seconds = 300
             for _ in range(seconds * 2):
+                if self._is_shutdown:
+                    break
                 import time
                 time.sleep(0.5)
 
@@ -177,21 +193,22 @@ class RecordingManager:
 
 class StreamRecorder:
     """Per-stream recording state."""
-    def __init__(self, stream_id: str, db: Session, storage: StorageProvider, settings: Any) -> None:
+    def __init__(self, stream_id: str, db: Session, storage: StorageProvider, settings: Any, executor: ThreadPoolExecutor) -> None:
         self.stream_id = stream_id
         self._db = db
         self._session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
         self._storage = storage
         self._settings = settings
+        self._executor = executor
         self._frame_queue: Queue = Queue(maxsize=120)
         self._pre_buffer: List[Any] = []
         self._active_recording: Optional[Recording] = None
         self._recording_lock = threading.Lock()
         self._running = False
-        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
-        self._writer_thread.start()
-        self._clip_thread = threading.Thread(target=self._clip_loop, daemon=True)
-        self._clip_thread.start()
+        
+        # Enqueue a single drain task instead of dedicating an infinite loop thread
+        self._writer_task_active = False
+        self._writer_task_lock = threading.Lock()
 
     def start(self) -> Recording:
         with self._recording_lock:
@@ -229,6 +246,12 @@ class StreamRecorder:
         if self._frame_queue is not None:
             try:
                 self._frame_queue.put_nowait(frame)
+                
+                # Ensure the writer task is running on the shared executor
+                with self._writer_task_lock:
+                    if not self._writer_task_active:
+                        self._writer_task_active = True
+                        self._executor.submit(self._writer_drain_task)
             except Exception:  # noqa: BLE001
                 om.DROPPED_RECORDING_FRAMES_TOTAL.labels(stream_id=self.stream_id).inc()
 
@@ -239,12 +262,11 @@ class StreamRecorder:
         pre_frames = self._pre_buffer[-getattr(self._settings, "recording_pre_buffer_frames", 30):]
         post_duration = getattr(self._settings, "recording_post_buffer_duration_seconds", 5.0)
         rec = self._switch_segment(rec)
-        # Offload clip generation to background thread to avoid blocking inference
-        threading.Thread(
-            target=self._process_event_clip,
-            args=(rec, event_type, event_data, pre_frames, post_duration),
-            daemon=True,
-        ).start()
+        # Offload clip generation to the shared background executor to avoid blocking inference
+        self._executor.submit(
+            self._process_event_clip,
+            rec, event_type, event_data, pre_frames, post_duration
+        )
 
     def _switch_segment(self, rec: Recording) -> Recording:
         rec.end_time = datetime.now(timezone.utc)
@@ -252,26 +274,28 @@ class StreamRecorder:
         self._db.commit()
         return self.start()
 
-    def _writer_loop(self) -> None:
-        import time
-        while self._running:
-            try:
-                frame = self._frame_queue.get(timeout=1.0)
-                if frame is None:
+    def _writer_drain_task(self) -> None:
+        """Drains the frame queue in the background executor, yielding when empty."""
+        try:
+            # Drain until empty or stopped
+            while self._running:
+                try:
+                    frame = self._frame_queue.get_nowait()
+                    if frame is None:
+                        break
+                    # In real implementation, this would write to a VideoWriter
+                    # For now, we just pass through
+                except Empty:
                     break
-                # In real implementation, this would write to a VideoWriter
-                # For now, we just pass through to the clip generator
-            except Exception:  # noqa: BLE001
-                break
-        self._running = False
-
-    def _clip_loop(self) -> None:
-        import time
-        while self._running:
-            try:
-                time.sleep(1.0)
-            except Exception:  # noqa: BLE001
-                break
+                except Exception:  # noqa: BLE001
+                    break
+        finally:
+            with self._writer_task_lock:
+                self._writer_task_active = False
+                # Re-check queue in case a frame arrived just before we cleared the flag
+                if self._running and not self._frame_queue.empty():
+                    self._writer_task_active = True
+                    self._executor.submit(self._writer_drain_task)
 
     def get_active_recording(self) -> Optional[Recording]:
         return self._active_recording

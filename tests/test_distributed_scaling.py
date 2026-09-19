@@ -12,7 +12,7 @@ import pytest
 from backend.ownership import LeaseManager, LeaderLease, StreamLease
 from backend.service import InferenceService, StreamConfig
 
-from distributed_fake_redis import FakeClock, FakeRedis
+from tests.distributed_fake_redis import FakeClock, FakeRedis
 
 
 def _manager(client, instance_id, **kwargs):

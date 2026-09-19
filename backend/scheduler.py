@@ -61,16 +61,15 @@ class _StreamChannel:
         self.in_flight = False
         self.enqueued = False
 
-    def take_newest(self) -> Optional[Tuple[Frame, float]]:
-        """Return the newest queued frame, dropping (and counting) the rest."""
+    def take_newest(self) -> Optional[Tuple[Frame, float, int]]:
+        """Return the newest queued frame, dropping the rest and returning dropped count."""
         if not self.pending:
             return None
         newest = self.pending.pop()
         dropped = len(self.pending)
         if dropped:
             self.pending.clear()
-            metrics.DROPPED_FRAMES_TOTAL.labels(stream_id=self.stream_id).inc(dropped)
-        return newest
+        return newest[0], newest[1], dropped
 
 
 class InferenceScheduler:
@@ -129,10 +128,11 @@ class InferenceScheduler:
         metrics.SCHEDULER_QUEUE_DEPTH.labels(stream_id=stream_id).set(0)
 
     def submit(self, stream_id: str, frame: Frame) -> None:
-        """Queue a frame for a registered stream, dropping the oldest on overflow."""
+        """Queue a frame for a registered stream, providing bounded backpressure on overflow."""
         # Stamp the arrival time before taking the lock: it is independent of
         # scheduler state, so keep the (hot-path) critical section minimal.
         submit_ts = time.perf_counter()
+        
         with self._cond:
             # Once stopping, accept no new work: a capture thread still alive
             # past its join timeout must not keep feeding a draining pool.
@@ -141,17 +141,23 @@ class InferenceScheduler:
             channel = self._channels.get(stream_id)
             if channel is None:
                 return
+                
+            # Bounded backpressure: block if the queue is full, preventing a fast
+            # capture thread from spinning endlessly and starving workers.
+            while len(channel.pending) >= channel.capacity and not self._stopping:
+                self._cond.wait()
+                
+            if self._stopping:
+                return
+                
             channel.pending.append((frame, submit_ts))
-            over = len(channel.pending) - channel.capacity
-            if over > 0:
-                for _ in range(over):
-                    channel.pending.popleft()
-                metrics.DROPPED_FRAMES_TOTAL.labels(stream_id=stream_id).inc(over)
             depth = len(channel.pending)
+            
             if not channel.in_flight and not channel.enqueued:
                 channel.enqueued = True
                 self._ready[channel.worker_index].append(stream_id)
                 self._cond.notify_all()
+                
         metrics.SCHEDULER_QUEUE_DEPTH.labels(stream_id=stream_id).set(depth)
 
     def unregister(self, stream_id: str) -> None:
@@ -218,7 +224,16 @@ class InferenceScheduler:
                     # refresh the depth gauge here too; submit only reflects the
                     # depth at enqueue and would otherwise read stale after a drain.
                     depth = len(channel.pending)
-                frame, submit_ts = item
+                    
+                    # Notify any blocked submitters that space is available
+                    self._cond.notify_all()
+                    
+                frame, submit_ts, dropped = item
+                
+                # Update metrics outside the critical lock path
+                if dropped > 0:
+                    metrics.DROPPED_FRAMES_TOTAL.labels(stream_id=stream_id).inc(dropped)
+                    
                 pickup_ts = time.perf_counter()
                 metrics.SCHEDULER_QUEUE_DEPTH.labels(stream_id=stream_id).set(depth)
                 metrics.SCHEDULER_WORKER_UTILIZATION.set(busy / self._num_workers)

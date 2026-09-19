@@ -212,6 +212,35 @@ class TestRecordingManager:
         recs = manager.list_recordings()
         assert len(recs) == 3
 
+    def test_executor_shutdown_is_idempotent(self, test_db, tmp_path):
+        storage = LocalFileStorageProvider(str(tmp_path / "rec"))
+        settings = get_settings()
+        manager = RecordingManager(test_db(), storage, settings)
+        manager.shutdown()
+        assert manager._is_shutdown is True
+        # Second shutdown should not raise
+        manager.shutdown()
+        assert manager._is_shutdown is True
+
+    def test_stale_work_cannot_survive_stream_shutdown(self, test_db, tmp_path):
+        storage = LocalFileStorageProvider(str(tmp_path / "rec"))
+        settings = get_settings()
+        manager = RecordingManager(test_db(), storage, settings)
+        manager.start_recording("stream1")
+        
+        # We push frames but they go to a queue
+        import numpy as np
+        dummy_frame = np.ones((10, 10, 3), dtype=np.uint8) * 255
+        manager.push_frame("stream1", dummy_frame)
+        
+        manager.stop_recording("stream1")
+        
+        # After stopping the recording, stream1 is no longer tracked
+        # pushing frames to a stopped stream should be a no-op
+        manager.push_frame("stream1", dummy_frame)
+        # Should not raise or process
+        manager.shutdown()
+
 
 class TestRecordingAPI:
     def test_list_recordings_requires_auth(self, client, admin_user):
