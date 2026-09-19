@@ -66,6 +66,7 @@ class PerfResult:
 
     frames_dropped: int = 0
     drop_rate_pct: float = 0.0
+    backpressure_count: int = 0
 
     detector_latency_ms: float = 0.0
     frame_width: int = 0
@@ -101,6 +102,11 @@ class MultiPerfResult:
     
     # Fairness / variance
     fps_variance: float = 0.0
+    min_fps: float = 0.0
+    max_fps: float = 0.0
+    mean_fps: float = 0.0
+    
+    aggregate_backpressure_count: int = 0
 
     # Per stream results
     stream_results: list[PerfResult] = field(default_factory=list)
@@ -344,6 +350,15 @@ def run_multi_stream(
         if src.frames_produced > 0:
             res.drop_rate_pct = round(100.0 * res.frames_dropped / src.frames_produced, 2)
             
+        if scheduler_enabled:
+            from prometheus_client import REGISTRY
+            # Attempt to pull exact backpressure and dropped counts for this stream from Prometheus
+            try:
+                bp = REGISTRY.get_sample_value("omnitrack_scheduler_backpressure_total", labels={"stream_id": stream.config.stream_id})
+                res.backpressure_count = int(bp) if bp is not None else 0
+            except Exception:
+                pass
+            
         stream_latencies = all_latencies[i]
         if stream_latencies:
             stream_latencies.sort()
@@ -356,6 +371,7 @@ def run_multi_stream(
         global_result.total_frames_produced += res.total_frames_produced
         global_result.total_frames_consumed += res.total_frames_consumed
         global_result.total_frames_dropped += res.frames_dropped
+        global_result.aggregate_backpressure_count += getattr(res, "backpressure_count", 0)
         global_result.aggregate_delivered_fps += res.delivered_fps
         global_result.aggregate_capture_fps += res.capture_fps
 
@@ -363,6 +379,11 @@ def run_multi_stream(
         global_result.aggregate_drop_rate_pct = round(
             100.0 * global_result.total_frames_dropped / global_result.total_frames_produced, 2
         )
+        
+    if stream_fps_list:
+        global_result.min_fps = round(min(stream_fps_list), 2)
+        global_result.max_fps = round(max(stream_fps_list), 2)
+        global_result.mean_fps = round(statistics.mean(stream_fps_list), 2)
         
     if len(stream_fps_list) > 1:
         global_result.fps_variance = round(statistics.variance(stream_fps_list), 2)

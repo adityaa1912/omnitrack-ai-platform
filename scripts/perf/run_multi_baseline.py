@@ -60,8 +60,8 @@ def main() -> None:
     print("=" * 60 + "\n")
     
     # Print markdown table header
-    print("| Streams | Agg FPS | Avg p50 (ms) | Avg p95 (ms) | Peak RSS (MB) | Threads | Drops (%) |")
-    print("|---------|---------|--------------|--------------|---------------|---------|-----------|")
+    print("| Streams | Agg FPS | Min/Max FPS | Var  | Avg p50 (ms) | Peak RSS (MB) | Threads | Drops (%) | Backpressure |")
+    print("|---------|---------|-------------|------|--------------|---------------|---------|-----------|--------------|")
 
     errors = False
 
@@ -78,7 +78,7 @@ def main() -> None:
         results.append(res)
         
         # Log row
-        print(f"| {n:<7} | {res.aggregate_delivered_fps:<7.1f} | {res.global_latency_p50_ms:<12.1f} | {res.global_latency_p95_ms:<12.1f} | {res.peak_rss_mb:<13.1f} | {res.thread_count:<7} | {res.aggregate_drop_rate_pct:<9.1f} |")
+        print(f"| {n:<7} | {res.aggregate_delivered_fps:<7.1f} | {res.min_fps:<4.1f}/{res.max_fps:<4.1f} | {res.fps_variance:<4.1f} | {res.global_latency_p50_ms:<12.1f} | {res.peak_rss_mb:<13.1f} | {res.thread_count:<7} | {res.aggregate_drop_rate_pct:<9.1f} | {res.aggregate_backpressure_count:<12} |")
         sys.stdout.flush()
         
         if res.errors:

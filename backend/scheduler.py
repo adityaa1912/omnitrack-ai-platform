@@ -144,10 +144,14 @@ class InferenceScheduler:
                 
             # Bounded backpressure: block if the queue is full, preventing a fast
             # capture thread from spinning endlessly and starving workers.
-            while len(channel.pending) >= channel.capacity and not self._stopping:
+            blocked = False
+            while stream_id in self._channels and len(channel.pending) >= channel.capacity and not self._stopping:
+                if not blocked:
+                    metrics.SCHEDULER_BACKPRESSURE_TOTAL.labels(stream_id=stream_id).inc()
+                    blocked = True
                 self._cond.wait()
                 
-            if self._stopping:
+            if self._stopping or stream_id not in self._channels:
                 return
                 
             channel.pending.append((frame, submit_ts))
@@ -185,6 +189,8 @@ class InferenceScheduler:
                 self._load[channel.worker_index] = max(
                     self._load[channel.worker_index] - 1, 0
                 )
+            # Wake up any submitters blocked on this channel's capacity so they exit
+            self._cond.notify_all()
         if channel is not None:
             metrics.SCHEDULER_QUEUE_DEPTH.labels(stream_id=stream_id).set(0)
 

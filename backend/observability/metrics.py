@@ -186,6 +186,13 @@ SCHEDULER_QUEUE_DEPTH = Gauge(
     registry=registry,
 )
 
+SCHEDULER_BACKPRESSURE_TOTAL = Counter(
+    "omnitrack_scheduler_backpressure_total",
+    "Total frames blocked/backpressured in the scheduler.",
+    labelnames=("stream_id",),
+    registry=registry,
+)
+
 # Fraction of the scheduler worker pool currently busy (busy / total workers).
 SCHEDULER_WORKER_UTILIZATION = Gauge(
     "omnitrack_scheduler_worker_utilization",
