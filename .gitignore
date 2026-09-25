@@ -20,3 +20,6 @@ Thumbs.db
 
 # Performance test results
 scripts/perf/results/*.json
+
+# GSD Planning
+.planning/
