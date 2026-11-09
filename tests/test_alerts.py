@@ -327,6 +327,41 @@ class TestManager:
         session.close()
         assert inst.suppressed_until is not None
 
+    def test_suppression_deadline_expires(self, manager, db):
+        """After suppressed_until passes, run_expiry unblocks dedup/re-trigger."""
+        alert_id = manager.trigger(_rule(dedup_key="d1"), {}, "cam1", _event())
+        manager.suppress(alert_id, "op", 1)
+        session = db()
+        inst = session.query(AlertInstance).filter_by(id=alert_id).first()
+        inst.suppressed_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.commit()
+        session.close()
+        assert manager.run_expiry() == 1
+        session = db()
+        inst = session.query(AlertInstance).filter_by(id=alert_id).first()
+        session.close()
+        assert inst.state == "expired"
+        # A re-trigger for the same dedup key is no longer dedup-blocked.
+        assert manager.trigger(_rule(dedup_key="d1"), {}, "cam1", _event()) is not None
+
+    def test_suppression_deadline_history_consistent(self, manager, db):
+        alert_id = manager.trigger(_rule(dedup_key="d1"), {}, "cam1", _event())
+        manager.suppress(alert_id, "op", 1)
+        session = db()
+        inst = session.query(AlertInstance).filter_by(id=alert_id).first()
+        inst.suppressed_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.commit()
+        session.close()
+        assert manager.run_expiry() == 1
+        session = db()
+        history = session.query(AlertStateHistory).filter_by(
+            alert_instance_id=alert_id,
+        ).order_by(AlertStateHistory.changed_at).all()
+        session.close()
+        states = [h.to_state for h in history]
+        assert "suppressed" in states
+        assert "expired" in states
+
     def test_invalid_transition(self, manager, db):
         alert_id = manager.trigger(_rule(dedup_key="d1"), {}, "cam1", _event())
         manager.resolve(alert_id, "op")

@@ -12,6 +12,7 @@
  */
 
 import { env } from "@/config/env";
+import { getAccessToken } from "@/lib/auth";
 import type { WsFrameMessage, WsMessage } from "@/types/api";
 
 export type SocketStatus =
@@ -33,7 +34,11 @@ export interface StreamSocketOptions {
 function buildWsUrl(streamId: string): string {
   const base = env.wsBaseUrl.replace(/\/$/, "");
   const path = `/stream/${encodeURIComponent(streamId)}/ws`;
-  const query = env.apiKey ? `?api_key=${encodeURIComponent(env.apiKey)}` : "";
+  const params = new URLSearchParams();
+  if (env.apiKey) params.set("api_key", env.apiKey);
+  const token = getAccessToken();
+  if (token) params.set("access_token", token);
+  const query = params.toString() ? `?${params.toString()}` : "";
   if (/^wss?:\/\//i.test(base)) return `${base}${path}${query}`;
   const origin = window.location.origin.replace(/^http/i, "ws");
   return `${origin}${base}${path}${query}`;

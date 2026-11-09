@@ -16,7 +16,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
-*.pt
+
+# yolov8n.pt is a tracked production model dependency; do not ignore it.
 
 # Performance test results
 scripts/perf/results/*.json

@@ -849,6 +849,9 @@ bearer_scheme = HTTPBearer(auto_error=False)
 api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+_original_openapi = app.openapi
+
+
 def custom_openapi():
     """Add JWT Bearer and API Key security schemes to the OpenAPI schema.
 
@@ -858,7 +861,7 @@ def custom_openapi():
     """
     if app.openapi_schema:
         return app.openapi_schema
-    openapi_schema = app.openapi()
+    openapi_schema = _original_openapi()
     # Define security schemes
     openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})
     openapi_schema["components"]["securitySchemes"] = {
@@ -923,7 +926,7 @@ from backend.auth import router as auth_router
 from backend.auth.dependencies import configure_get_db, get_current_user_optional, require_role
 
 # Configure the auth dependency to use the service's scoped_session
-configure_get_db(lambda: service.Session())
+configure_get_db(lambda: service.Session)
 
 app.include_router(auth_router.router)
 
@@ -1652,17 +1655,23 @@ async def _authenticate_websocket(websocket: WebSocket) -> Optional[CurrentUser]
 
     if token:
         from backend.auth.dependencies import get_current_user
+        db = service.Session()
         try:
-            return await get_current_user(token=token, db=service.Session())
+            return await get_current_user(token=token, db=db)
         except Exception:
             return None
+        finally:
+            db.remove()
 
     if api_key:
         from backend.auth.dependencies import get_api_key_user
+        db = service.Session()
         try:
-            return await get_api_key_user(api_key=api_key, db=service.Session())
+            return await get_api_key_user(api_key=api_key, db=db)
         except Exception:
             return None
+        finally:
+            db.remove()
 
     return None
 

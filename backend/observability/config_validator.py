@@ -60,5 +60,10 @@ def safe_effective_config(settings: Any) -> Dict[str, Any]:
         if any(s in lower for s in ("password", "secret", "token")) and key not in _SECRET_FIELDS:
             if raw[key] is not None:
                 raw[key] = _REDACTED
+                continue
+        # Redact database/broker DSNs which may embed credentials in userinfo.
+        if any(s in lower for s in ("postgres_url", "redis_url", "database_url", "broker_url")):
+            if raw[key] is not None:
+                raw[key] = _REDACTED
 
     return raw

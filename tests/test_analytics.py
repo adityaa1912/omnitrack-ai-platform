@@ -22,7 +22,7 @@ from backend.analytics.models import AnalyticsSummary, ZoneOccupancy, LineCrossi
 
 def _event(
     stream_id: str = "cam1",
-    event_type: str = "OBJECT_APPEARED",
+    event_type: str = "object_appeared",
     track_id: Optional[int] = None,
     class_name: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -85,15 +85,15 @@ class TestAnalyticsAggregator:
 
     def test_object_disappeared_removes_track(self, agg):
         agg.handle_event(_event(track_id=1, class_name="person"))
-        agg.handle_event(_event(event_type="OBJECT_DISAPPEARED", track_id=1))
+        agg.handle_event(_event(event_type="object_disappeared", track_id=1))
         data = agg.get_current("cam1")
         assert data["unique_tracks"] == 0
 
     def test_object_entered_counts(self, agg):
         agg.handle_event(_event(
-            event_type="OBJECT_ENTERED",
+            event_type="object_entered",
             track_id=5,
-            metadata={"zone_name": " lobby "},
+            metadata={"zone": " lobby "},
         ))
         data = agg.get_current("cam1")
         assert data["zone_occupancy"][" lobby "]["entries"] == 1
@@ -101,15 +101,15 @@ class TestAnalyticsAggregator:
     def test_object_exited_counts(self, agg):
         now = time.time()
         agg.handle_event(_event(
-            event_type="OBJECT_ENTERED",
+            event_type="object_entered",
             track_id=10,
-            metadata={"zone_name": "restricted"},
+            metadata={"zone": "restricted"},
             timestamp=now,
         ))
         agg.handle_event(_event(
-            event_type="OBJECT_EXITED",
+            event_type="object_exited",
             track_id=10,
-            metadata={"zone_name": "restricted"},
+            metadata={"zone": "restricted"},
             timestamp=now + 10.0,
         ))
         data = agg.get_current("cam1")
@@ -120,14 +120,14 @@ class TestAnalyticsAggregator:
 
     def test_line_crossing_direction(self, agg):
         agg.handle_event(_event(
-            event_type="CROSSING_DIRECTION",
+            event_type="crossing_direction",
             track_id=1,
-            metadata={"line_name": "gate", "direction": "positive"},
+            metadata={"line": "gate", "direction": "positive", "positive_label": "positive"},
         ))
         agg.handle_event(_event(
-            event_type="CROSSING_DIRECTION",
+            event_type="crossing_direction",
             track_id=2,
-            metadata={"line_name": "gate", "direction": "negative"},
+            metadata={"line": "gate", "direction": "negative", "positive_label": "positive"},
         ))
         crosses = agg.get_line_crossings("cam1")
         assert crosses["gate"]["positive"] == 1
@@ -135,8 +135,8 @@ class TestAnalyticsAggregator:
 
     def test_dwelling_time(self, agg):
         agg.handle_event(_event(
-            event_type="DWELL_TIME",
-            metadata={"zone_name": "area1", "seconds": 30.0},
+            event_type="dwell_time",
+            metadata={"zone": "area1", "seconds": 30.0},
         ))
         data = agg.get_current("cam1")
         assert data["dwell_time_total_seconds"] == 30.0
@@ -160,14 +160,14 @@ class TestAnalyticsAggregator:
         agg.handle_event(_event(class_name="person"))
         agg.handle_event(_event(class_name="car", track_id=1))
         agg.handle_event(_event(
-            event_type="OBJECT_ENTERED",
+            event_type="object_entered",
             track_id=1,
-            metadata={"zone_name": "zoneA"},
+            metadata={"zone": "zoneA"},
         ))
         agg.handle_event(_event(
-            event_type="OBJECT_EXITED",
+            event_type="object_exited",
             track_id=1,
-            metadata={"zone_name": "zoneA"},
+            metadata={"zone": "zoneA"},
         ))
         agg._flush_once()
         # _flush_once creates exactly one session; verify add/commit were called.
@@ -210,17 +210,186 @@ class TestStreamAgg:
         agg = AnalyticsAggregator(lambda: None)
         now = time.time()
         agg.handle_event(_event(
-            event_type="OBJECT_ENTERED",
+            event_type="object_entered",
             track_id=1,
-            metadata={"zone_name": "kitchen"},
+            metadata={"zone": "kitchen"},
             timestamp=now,
         ))
         agg.handle_event(_event(
-            event_type="DWELL_TIME",
-            metadata={"zone_name": "kitchen", "seconds": 12.5},
+            event_type="dwell_time",
+            metadata={"zone": "kitchen", "seconds": 12.5},
         ))
         data = agg.get_zone_occupancy("cam1", "kitchen")
         assert data["kitchen"]["dwell_seconds"] == 12.5
+
+
+# ---------------------------------------------------------------------------
+# Task 1 regressions: real producer-format events, flush preservation,
+# failed commit, custom line labels, dwell/occupancy across windows.
+# ---------------------------------------------------------------------------
+
+class TestProducerFormatRegressions:
+    """Feed actual Event.to_dict()-style records (lowercase event_type,
+    metadata zone/line/dwell_seconds) and assert counts, zones, dwell."""
+
+    def test_appeared_and_disappeared_counts(self, agg):
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="person"))
+        agg.handle_event(_event(event_type="object_appeared", track_id=2, class_name="person"))
+        agg.handle_event(_event(event_type="object_disappeared", track_id=1))
+        data = agg.get_current("cam1")
+        assert data["object_counts"]["person"] == 2
+        assert data["unique_tracks"] == 1
+
+    def test_entered_exited_named_zone(self, agg):
+        now = time.time()
+        agg.handle_event(_event(
+            event_type="object_entered", track_id=1, class_name="person",
+            metadata={"zone": "lobby"}, timestamp=now,
+        ))
+        agg.handle_event(_event(
+            event_type="object_exited", track_id=1, class_name="person",
+            metadata={"zone": "lobby"}, timestamp=now + 10.0,
+        ))
+        data = agg.get_current("cam1")
+        zone = data["zone_occupancy"]["lobby"]
+        assert zone["entries"] == 1
+        assert zone["exits"] == 1
+        assert zone["occupancy_seconds"] >= 10.0
+        assert data["dwell_time_total_seconds"] >= 10.0
+
+    def test_line_crossing_custom_labels(self, agg):
+        agg.handle_event(_event(
+            event_type="crossing_direction", track_id=1,
+            metadata={"line": "gate", "direction": "in", "positive_label": "in"},
+        ))
+        agg.handle_event(_event(
+            event_type="crossing_direction", track_id=2,
+            metadata={"line": "gate", "direction": "out", "positive_label": "in"},
+        ))
+        crosses = agg.get_line_crossings("cam1")
+        assert crosses["gate"]["positive"] == 1   # "in" == positive_label
+        assert crosses["gate"]["negative"] == 1   # "out" != positive_label
+
+    def test_dwell_time_threshold_record(self, agg):
+        agg.handle_event(_event(
+            event_type="dwell_time",
+            metadata={"zone": "area1", "seconds": 30.0, "threshold_seconds": 5.0},
+        ))
+        data = agg.get_current("cam1")
+        assert data["dwell_time_total_seconds"] == 30.0
+        assert data["zone_occupancy"]["area1"]["dwell_seconds"] == 30.0
+
+    def test_custom_labels_backward_compatible_default_positive(self, agg):
+        # No positive_label metadata: defaults to "positive".
+        agg.handle_event(_event(
+            event_type="crossing_direction", track_id=1,
+            metadata={"line": "gate", "direction": "positive"},
+        ))
+        assert agg.get_line_crossings("cam1")["gate"]["positive"] == 1
+
+
+class TestFlushPreservation:
+    def _session(self):
+        s = MagicMock()
+        s.commit.side_effect = None
+        return s
+
+    def _agg_stream(self, agg):
+        return agg._per_stream["cam1"]
+
+    def test_active_zone_membership_survives_flush(self, agg):
+        """A track inside a zone at flush time remains counted after flush."""
+        now = time.time()
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="person"))
+        agg.handle_event(_event(
+            event_type="object_entered", track_id=1, class_name="person",
+            metadata={"zone": "lobby"}, timestamp=now,
+        ))
+        before = agg.get_current("cam1")
+        assert before["zone_occupancy"]["lobby"]["entries"] == 1
+        self._agg_stream(agg).flush(lambda: self._session())
+        after = agg.get_current("cam1")
+        # Track still present after flush (not dropped).
+        assert after["unique_tracks"] == 1
+
+    def test_dwell_occupancy_across_windows_and_disappearance(self, agg):
+        now = time.time()
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="person"))
+        agg.handle_event(_event(
+            event_type="object_entered", track_id=1, class_name="person",
+            metadata={"zone": "lobby"}, timestamp=now,
+        ))
+        agg.handle_event(_event(
+            event_type="object_exited", track_id=1, class_name="person",
+            metadata={"zone": "lobby"}, timestamp=now + 5.0,
+        ))
+        # Snapshot pre-flush counters (window stats are reset by flush).
+        pre = self._agg_stream(agg).get_zone_occupancy("lobby")
+        assert pre["lobby"]["entries"] == 1
+        assert pre["lobby"]["exits"] == 1
+        self._agg_stream(agg).flush(lambda: self._session())
+        # Track remains a live member after flush (occupancy continues).
+        assert len(self._agg_stream(agg)._tracks) == 1
+
+    def test_failed_commit_retains_data_exactly_once(self, agg):
+        """A failed DB commit keeps in-memory data intact (retry flushes once)."""
+        class FailingSession:
+            def add(self, obj): pass
+            def commit(self): raise RuntimeError("db down")
+            def rollback(self): pass
+            def close(self): pass
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="car"))
+        assert agg.get_current("cam1")["object_counts"]["car"] == 1
+        self._agg_stream(agg).flush(lambda: FailingSession())  # flush must not raise / lose data
+        assert agg.get_current("cam1")["object_counts"]["car"] == 1
+        # Retry flush after the failure succeeds and clears the window (data
+        # counted exactly once across the two flush attempts).
+        self._agg_stream(agg).flush(lambda: self._session())
+
+    def test_manual_flush_succeeds_and_closes_session(self, agg):
+        sessions = []
+        class CountingSession:
+            def __init__(self):
+                sessions.append(self)
+                self.closed = False
+                self.committed = False
+            def add(self, obj): pass
+            def commit(self): self.committed = True
+            def rollback(self): pass
+            def close(self): self.closed = True
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="car"))
+        agg._per_stream["cam1"].flush(lambda: CountingSession())
+        assert len(sessions) == 1
+        assert sessions[0].committed
+        assert sessions[0].closed
+
+    def test_cached_object_count_equals_uncached(self):
+        json_cache = MagicMock()
+        json_cache.available = True
+        store = {}
+        def get(key):
+            return store.get(key)
+        def set_(key, value, ttl_seconds=None):
+            store[key] = value
+            return True
+        json_cache.get.side_effect = get
+        json_cache.set.side_effect = set_
+        cache = AnalyticsCache(json_cache)
+
+        agg = AnalyticsAggregator(lambda: None)
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="car"))
+        uncached = agg.get_object_counts("cam1")
+        # Stored (cached) response equals the uncached response.
+        cache.set(uncached, "analytics", "cam1", "objects")
+        assert store["analytics:cam1:objects"] == uncached
+
+    def test_flush_takes_session_factory(self, agg):
+        """_StreamAgg.flush accepts a session factory callable (not a session)."""
+        factory = MagicMock()
+        factory.return_value = MagicMock()
+        agg.handle_event(_event(event_type="object_appeared", track_id=1, class_name="car"))
+        agg._per_stream["cam1"].flush(factory)
+        factory.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

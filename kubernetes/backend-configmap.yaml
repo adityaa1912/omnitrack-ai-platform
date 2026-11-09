@@ -11,6 +11,7 @@ data:
   OMNITRACK_API_HOST: "0.0.0.0"
   OMNITRACK_API_PORT: "8000"
   OMNITRACK_API_WORKERS: "1"
+  OMNITRACK_CORS_ORIGINS: "https://app.omnitrack.example.com"
   OMNITRACK_REDIS_ENABLED: "true"
   OMNITRACK_REDIS_URL: "redis://redis.omnitrack.svc.cluster.local:6379/0"
   OMNITRACK_POSTGRES_URL: "postgresql+psycopg://omnitrack:omnitrack@postgres.omnitrack.svc.cluster.local:5432/omnitrack"

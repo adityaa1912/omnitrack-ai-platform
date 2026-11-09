@@ -288,6 +288,22 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("postgres_url", "redis_url", mode="before")
+    @classmethod
+    def _empty_connection_string_to_none(cls, value: str | None) -> str | None:
+        """Compose sets empty strings when env vars are unset; treat as None."""
+        if value == "":
+            return None
+        return value
+
+    @field_validator("kafka_bootstrap_servers", mode="before")
+    @classmethod
+    def _empty_kafka_to_none(cls, value: str | None) -> str | None:
+        """Compose sets empty strings when env vars are unset; treat as None."""
+        if value == "":
+            return None
+        return value
+
     @field_validator("kafka_bootstrap_servers")
     @classmethod
     def _validate_kafka_bootstrap_servers(cls, value: str | None) -> str | None:

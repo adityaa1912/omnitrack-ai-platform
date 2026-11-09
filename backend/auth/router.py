@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from backend.auth.dependencies import (
     get_db,
     get_current_user,
+    get_current_user_optional,
     CurrentUser,
     require_role,
 )
@@ -117,18 +118,47 @@ async def refresh_token(request: Request, refresh_token: str, db: Session = Depe
 
 
 @router.post("/logout")
-async def logout(request: Request, jti: Optional[str] = None, db: Session = Depends(get_db)):
-    """Logout by revoking the session."""
+async def logout(
+    request: Request,
+    jti: Optional[str] = None,
+    user: CurrentUser = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    """Logout by revoking the session.
+
+    Accepts a bearer token (``Authorization: Bearer <token>``) and revokes that
+    token's session when session management is enabled — a bearer logout revokes
+    the caller's own session only. The legacy ``jti`` query/body parameter is
+    kept for compatibility, but bearer-authenticated logouts prefer the token's
+    own JTI so no cross-user revocation is possible.
+    """
+    settings = get_settings()
     service = AuthService(db)
-    success = service.logout(jti) if jti else True
+
+    target_jti = jti
+    if user is not None and not user.via_api_key:
+        token = await _get_token_from_request(request)
+        if token:
+            from backend.auth.security import decode_jwt
+
+            payload = decode_jwt(token, settings.jwt_secret or "")
+            if payload and payload.get("jti"):
+                target_jti = payload["jti"]
+
+    if settings.session_management_enabled and target_jti:
+        success = service.logout(target_jti)
+    else:
+        # Stateless JWT (no session management) or nothing to revoke:
+        # logout is still a success.
+        success = True
 
     ip, user_agent = _get_client_info(request)
     service.log_audit_event(
-        user_id=None,
-        username=None,
+        user_id=user.user_id if user else None,
+        username=user.username if user else None,
         action="logout",
         resource_type="auth",
-        resource_id=jti,
+        resource_id=target_jti,
         status="success" if success else "failure",
         ip_address=ip,
         user_agent=user_agent,

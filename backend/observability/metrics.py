@@ -118,6 +118,12 @@ STREAMS_STOPPED_TOTAL = Counter(
     registry=registry,
 )
 
+STREAMS_STOPPING_TOTAL = Counter(
+    "omnitrack_streams_stopping_total",
+    "Total inference streams whose stop join timed out and are deferred to reap.",
+    registry=registry,
+)
+
 STREAM_ERRORS_TOTAL = Counter(
     "omnitrack_stream_errors_total",
     "Total inference-loop errors, by stream.",

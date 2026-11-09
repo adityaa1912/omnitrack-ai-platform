@@ -23,6 +23,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _run_alembic_upgrade() -> None:
+    """Bring the database schema up to date before the app starts.
+
+    Runs ``alembic upgrade head`` so the running image converges to the latest
+    schema without a separate operator step. For SQLite (default) this is a
+    local file migration; for PostgreSQL it migrates the configured database.
+    Failures here are non-fatal at startup so local development isn't blocked
+    by a missing migration environment — the app still starts and can
+    ``create_all`` convenience tables instead.
+    """
+    try:
+        from alembic.config import Config
+        from alembic import command
+
+        ini = os.path.join(os.path.dirname(os.path.dirname(__file__)), "alembic.ini")
+        cfg = Config(ini)
+        cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "..", "alembic"))
+        command.upgrade(cfg, "head")
+    except Exception as exc:  # noqa: BLE001 - migrations are best-effort at startup
+        logger.warning("Alembic upgrade skipped: %s", exc)
+
+
 def main():
     """Run FastAPI backend server."""
     settings = get_settings()
@@ -40,6 +62,10 @@ def main():
     parser.add_argument("--db", default=settings.sqlite_path, help="SQLite database file path")
 
     args = parser.parse_args()
+
+    # Run Alembic migrations before starting the app so the schema converges
+    # to the latest revision without a separate operator step.
+    _run_alembic_upgrade()
 
     # Preserve the existing --db CLI contract while keeping backend.main and
     # direct Uvicorn startup on the same validated settings path.

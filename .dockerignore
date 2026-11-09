@@ -29,8 +29,6 @@ test_recovery.db
 PROJECT_DOCS
 BACKEND_QUICKREF.md
 README.md
-alembic.ini
-alembic
 kafka
 kubernetes
 monitoring

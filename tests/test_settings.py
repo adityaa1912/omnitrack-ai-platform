@@ -62,3 +62,52 @@ def test_future_connection_settings_are_validated() -> None:
 
     with pytest.raises(ValidationError, match="host:port"):
         Settings(_env_file=None, kafka_bootstrap_servers="broker-without-port")
+
+
+def test_model_path_defaults_to_tracked_yolov8n_pt() -> None:
+    """yolov8n.pt must exist at repo root so a clean checkout builds the image."""
+    from pathlib import Path
+
+    settings = Settings(_env_file=None)
+    assert settings.model_path == "yolov8n.pt"
+    assert Path(settings.model_path).is_file()
+
+
+def test_sqlite_database_url_uses_sqlite_path() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.database_url == f"sqlite:///{settings.sqlite_path}"
+    assert settings.database_is_sqlite
+
+
+def test_alembic_migration_graph_has_single_linear_head() -> None:
+    """The Alembic versions directory must form a single linear chain."""
+    import ast
+    from pathlib import Path
+
+    versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
+    revisions = []
+    down = {}
+    for p in sorted(versions_dir.glob("*.py")):
+        if p.name == "__init__.py":
+            continue
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        rev = dr = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "revision":
+                        rev = ast.literal_eval(node.value)
+                    if isinstance(t, ast.Name) and t.id == "down_revision":
+                        dr = ast.literal_eval(node.value)
+        if rev:
+            revisions.append(rev)
+            down[rev] = dr
+
+    assert revisions, "no migration revisions found"
+    assert len(set(revisions)) == len(revisions), "duplicate revision ids"
+    known = set(revisions)
+    parents = {dr for dr in down.values() if isinstance(dr, str)}
+    unknown = parents - known
+    assert not unknown, f"down_revision references missing revisions: {unknown}"
+    heads = [r for r in revisions if r not in parents]
+    assert len(heads) == 1, f"expected exactly 1 migration head, found {heads}"
