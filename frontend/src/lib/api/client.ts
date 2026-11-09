@@ -50,6 +50,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const headers: Record<string, string> = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (env.apiKey) headers["X-API-Key"] = env.apiKey;
+  const token = typeof localStorage !== "undefined" ? localStorage.getItem("omnitrack_access_token") : null;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const response = await fetch(buildUrl(path, query), {
     method,

@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import and_, or_
+
 from ..observability import metrics as om
 from ..observability.logging import get_logger
 from .models import AlertInstance, AlertStateHistory
@@ -239,9 +241,18 @@ class AlertManager:
             rows = (
                 session.query(AlertInstance)
                 .filter(
-                    AlertInstance.state.in_(("triggered", "acknowledged")),
-                    AlertInstance.expires_at != None,  # noqa: E711
-                    AlertInstance.expires_at < now,
+                    or_(
+                        and_(
+                            AlertInstance.state == "suppressed",
+                            AlertInstance.suppressed_until != None,  # noqa: E711
+                            AlertInstance.suppressed_until < now,
+                        ),
+                        and_(
+                            AlertInstance.state.in_(("triggered", "acknowledged")),
+                            AlertInstance.expires_at != None,  # noqa: E711
+                            AlertInstance.expires_at < now,
+                        ),
+                    )
                 )
                 .all()
             )

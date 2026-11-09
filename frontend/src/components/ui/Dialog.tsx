@@ -5,6 +5,10 @@ import { cn } from "@/lib/utils/cn";
  * Accessible modal dialog: focus trap, Esc to close, backdrop click to
  * close, and focus restoration on unmount. Renders inline (no portal) for
  * simplicity; the shell has no stacking contexts that interfere.
+ *
+ * Focus trap: while open, Tab cycles focus among focusable elements inside
+ * the panel; focus cannot escape to the backdrop or page behind. When the
+ * dialog closes, focus is restored to the previously focused element.
  */
 export function Dialog({
   open,
@@ -24,7 +28,37 @@ export function Dialog({
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key === "Tab") {
+        const panel = panelRef.current;
+        if (!panel) return;
+        const focusable = Array.from(
+          panel.querySelectorAll<HTMLElement>(
+            "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])"
+          )
+        );
+        if (focusable.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        const current = document.activeElement as HTMLElement | null;
+        const index = focusable.indexOf(current as HTMLElement);
+        if (e.shiftKey) {
+          if (index <= 0) {
+            e.preventDefault();
+            (focusable[focusable.length - 1] as HTMLElement)?.focus();
+          }
+        } else {
+          if (index === -1 || index >= focusable.length - 1) {
+            e.preventDefault();
+            (focusable[0] as HTMLElement)?.focus();
+          }
+        }
+      }
     },
     [onClose],
   );
@@ -35,7 +69,7 @@ export function Dialog({
     document.addEventListener("keydown", handleKeyDown);
     // Move focus into the panel on open.
     const firstFocusable = panelRef.current?.querySelector<HTMLElement>(
-      "input, button, [tabindex]",
+      "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])"
     );
     firstFocusable?.focus();
     return () => {

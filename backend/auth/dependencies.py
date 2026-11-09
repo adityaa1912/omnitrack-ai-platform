@@ -35,22 +35,47 @@ class CurrentUser(BaseModel):
 # Using a callable that is replaced at app startup, allowing auth routes to use
 # the service's scoped_session without a circular import.
 class _GetDb:
-    """Callable dependency for DB session; replaced by main.py at startup."""
+    """Callable dependency for DB session; replaced by main.py at startup.
+
+    Yields a request-scoped session and guarantees it is closed (via
+    scoped_session.remove()) after the request completes, so the thread-local
+    session and its pooled connection are always released.
+    """
 
     _provider = None
 
     def __call__(self):
         if self._provider is None:
             raise RuntimeError("get_db not configured — call configure_get_db()")
-        return self._provider()
+        db = self._provider()
+        try:
+            yield db
+        finally:
+            db.remove()
 
 
 _get_db_impl = _GetDb()
 
 
 def get_db():
-    """FastAPI dependency: current thread database session from the service Session."""
-    return _get_db_impl()
+    """FastAPI dependency: current thread database session from the service Session.
+
+    A generator dependency: yields the session and closes it (releases the
+    thread-local scoped session via scoped_session.remove()) once the request
+    is done. The provider may return either a ``scoped_session`` (production,
+    where ``Session.remove()`` releases the thread-local) or a plain ``Session``
+    (tests), in which case ``close()`` is used instead.
+    """
+    if _get_db_impl._provider is None:
+        raise RuntimeError("get_db not configured — call configure_get_db()")
+    db = _get_db_impl._provider()
+    try:
+        yield db
+    finally:
+        if hasattr(db, "remove"):
+            db.remove()
+        else:
+            db.close()
 
 
 def configure_get_db(provider) -> None:

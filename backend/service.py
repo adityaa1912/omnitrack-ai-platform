@@ -863,6 +863,11 @@ class InferenceService:
         # stream in the narrow interval after ``stop`` flips is_running.
         self._streams_lock = threading.RLock()
         self._stopping: set[str] = set()
+        # Event-buffer subscriber tokens per stream, so a stream restart or
+        # failure doesn't accumulate duplicate subscribers (analytics, alerts,
+        # event publisher all subscribe at start). Tokens are unsubscribed on
+        # stream stop/reap so history is retained but callbacks are not doubled.
+        self._stream_subscribers: Dict[str, List[int]] = {}
         # Bounded in-memory event history per stream (persists across stop).
         self.event_store = EventStore(capacity=event_capacity)
         self._is_shutdown = False
@@ -1052,9 +1057,15 @@ class InferenceService:
         )
         # Subscribe the derived-event publisher (Kafka bus) to this stream's
         # buffer. Guarded so a misbehaving publisher can never block a start.
+        # Capture the token so we can unsubscribe on stop/reap (prevents
+        # duplicate subscriptions on stream restart).
+        tokens: List[int] = []
         if self._event_publisher is not None:
             try:
-                self.event_store.get(config.stream_id).subscribe(self._event_publisher)
+                token = self.event_store.get(config.stream_id).subscribe(
+                    self._event_publisher
+                )
+                tokens.append(token)
             except Exception as exc:  # noqa: BLE001 - bus must not affect streams
                 logger.warning(
                     f"Could not subscribe event publisher for "
@@ -1064,9 +1075,10 @@ class InferenceService:
         # Guarded so a misbehaving aggregator can never block a stream start.
         if self._analytics is not None:
             try:
-                self.event_store.get(config.stream_id).subscribe(
+                token = self.event_store.get(config.stream_id).subscribe(
                     self._analytics.handle_event
                 )
+                tokens.append(token)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"Could not subscribe analytics for "
@@ -1076,14 +1088,17 @@ class InferenceService:
         # same EventBuffer.
         if self._alerts is not None:
             try:
-                self.event_store.get(config.stream_id).subscribe(
+                token = self.event_store.get(config.stream_id).subscribe(
                     self._alerts.handle_event
                 )
+                tokens.append(token)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"Could not subscribe alert engine for "
                     f"{config.stream_id}: {exc}"
                 )
+        if tokens:
+            self._stream_subscribers[config.stream_id] = tokens
         # Distributed mode: acquire the Redis lease BEFORE any resource is
         # opened. Exactly one replica can hold it; losing the race here means
         # another replica already owns this stream, so we refuse to start.
@@ -1118,7 +1133,16 @@ class InferenceService:
         return stream.get_metrics()
 
     def stop_stream(self, stream_id: str) -> None:
-        """Stop an inference stream."""
+        """Stop an inference stream.
+
+        Waits for the stream's inference thread to fully finalize (flush its
+        session row and release its resources) before releasing the lease and
+        dropping the registry entry, so we never relinquish an in-use resource
+        while a thread is still alive. Returns ``{"status": "stopped"}`` when
+        the thread drained; ``{"status": "stopping"}`` when the join timed out
+        (the stream is flagged down but not yet reaped — a later reap sweep
+        will clean up its lease and registry entry).
+        """
         with self._streams_lock:
             stream = self.streams.get(stream_id)
             if stream is None:
@@ -1128,8 +1152,31 @@ class InferenceService:
         try:
             stream.stop()
         finally:
-            # Distributed mode: release the lease while we still hold the
-            # registry entry, so takeover can start immediately after.
+            # Unsubscribe this stream's event-store subscribers so a restart
+            # (or a later reap) never accumulates duplicate callbacks. History
+            # is retained in the EventStore; only the live delivery ends here.
+            with self._streams_lock:
+                tokens = self._stream_subscribers.pop(stream_id, [])
+            buffer = self.event_store.get(stream_id)
+            if buffer is not None:
+                for token in tokens:
+                    buffer.unsubscribe(token)
+
+            # Did the inference thread finish within the bounded join? If not,
+            # defer lease release and registry pop to reap_finished so we never
+            # relinquish an in-use resource while the thread is still alive.
+            thread_alive = stream.thread is not None and stream.thread.is_alive()
+            if thread_alive:
+                logger.warning(
+                    f"Stream {stream_id} stop: inference thread still alive after "
+                    f"join timeout; deferring lease release and registry pop to reap"
+                )
+                metrics.STREAMS_STOPPING_TOTAL.labels(stream_id=stream_id).inc()
+                # Allow reap_finished to later catch this stream once its thread
+                # finishes; keep the registry entry and lease until then.
+                with self._streams_lock:
+                    self._stopping.discard(stream_id)
+                return
             if self._lease_manager is not None:
                 if self._lease_manager.release(stream_id):
                     metrics.LEASE_OWNED_STREAMS.set(
@@ -1297,6 +1344,8 @@ class InferenceService:
         for stream in finished_streams:
             if stream is not None and stream.thread is not None:
                 stream.thread.join(timeout=1.0)
+            if stream is not None and self._lease_manager is not None:
+                self._lease_manager.release(stream.config.stream_id)
         if finished:
             logger.info(f"Reaped finished streams: {finished}")
         return len(finished)

@@ -405,9 +405,5 @@ async def flush_analytics(
     if agg is None:
         raise HTTPException(status_code=404, detail=f"No analytics data for stream {stream_id}")
 
-    session = _manager._session_factory()
-    try:
-        agg.flush(session)
-        return {"status": "flushed", "stream_id": stream_id}
-    finally:
-        session.close()
+    agg.flush(_manager._session_factory)
+    return {"status": "flushed", "stream_id": stream_id}

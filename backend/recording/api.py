@@ -3,6 +3,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from typing import List, Optional
+from sqlalchemy.orm import Session
 
 from backend.auth.dependencies import get_db, get_current_user, CurrentUser, require_role
 from backend.recording.manager import RecordingManager
@@ -54,84 +55,6 @@ def list_recordings(
         raise HTTPException(status_code=500, detail="Failed to list recordings")
 
 
-@router.get("/{recording_id}")
-def get_recording(
-    recording_id: int,
-    current_user: CurrentUser = Depends(get_current_user),
-):
-    from sqlalchemy.orm import Session
-    from backend.auth.dependencies import get_db
-    db = next(get_db())
-    try:
-        rec = db.query(Recording).filter_by(id=recording_id).first()
-        if rec is None:
-            raise HTTPException(status_code=404, detail="Recording not found")
-        return {
-            "id": rec.id,
-            "stream_id": rec.stream_id,
-            "start_time": rec.start_time,
-            "end_time": rec.end_time,
-            "status": rec.status,
-            "size_bytes": rec.size_bytes,
-            "metadata": rec.metadata,
-        }
-    finally:
-        db.close()
-
-
-@router.get("/{recording_id}/file")
-def get_recording_file(
-    recording_id: int,
-    current_user: CurrentUser = Depends(get_current_user),
-):
-    manager = get_manager()
-    if manager is None:
-        raise HTTPException(status_code=503, detail="Recording system not initialized")
-    file_path = manager.get_recording_file_path(recording_id)
-    if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Recording file not found")
-    return FileResponse(file_path, media_type="video/mp4")
-
-
-@router.get("/{recording_id}/evidences")
-def get_recording_evidences(
-    recording_id: int,
-    limit: int = Query(100, ge=1, le=1000),
-    current_user: CurrentUser = Depends(get_current_user),
-):
-    from sqlalchemy.orm import Session
-    from backend.auth.dependencies import get_db
-    db = next(get_db())
-    try:
-        evidences = db.query(Evidence).filter_by(recording_id=recording_id).order_by(Evidence.id.desc()).limit(limit).all()
-        return [
-            {
-                "id": e.id,
-                "type": e.type,
-                "file_path": e.file_path,
-                "metadata": e.extra,
-                "created_at": e.created_at,
-            }
-            for e in evidences
-        ]
-    finally:
-        db.close()
-
-
-@router.delete("/{recording_id}")
-def delete_recording(
-    recording_id: int,
-    current_user: CurrentUser = Depends(require_role("admin")),
-):
-    manager = get_manager()
-    if manager is None:
-        raise HTTPException(status_code=503, detail="Recording system not initialized")
-    success = manager.delete_recording(recording_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Recording not found")
-    return {"status": "deleted"}
-
-
 @router.get("/evidences")
 def list_evidences(
     recording_id: Optional[int] = Query(None),
@@ -153,3 +76,76 @@ def list_evidences(
                 "metadata": e.extra,
             })
     return result
+
+
+@router.get("/{recording_id}")
+def get_recording(
+    recording_id: int,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    rec = db.query(Recording).filter_by(id=recording_id).first()
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return {
+        "id": rec.id,
+        "stream_id": rec.stream_id,
+        "start_time": rec.start_time,
+        "end_time": rec.end_time,
+        "status": rec.status,
+        "size_bytes": rec.size_bytes,
+        "metadata": rec.metadata,
+    }
+
+
+@router.get("/{recording_id}/file")
+def get_recording_file(
+    recording_id: int,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    manager = get_manager()
+    if manager is None:
+        raise HTTPException(status_code=503, detail="Recording system not initialized")
+    file_path = manager.get_recording_file_path(recording_id)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Recording file not found")
+    return FileResponse(file_path, media_type="video/mp4")
+
+
+@router.get("/{recording_id}/evidences")
+def get_recording_evidences(
+    recording_id: int,
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    evidences = (
+        db.query(Evidence)
+        .filter_by(recording_id=recording_id)
+        .order_by(Evidence.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": e.id,
+            "type": e.type,
+            "file_path": e.file_path,
+            "metadata": e.extra,
+        }
+        for e in evidences
+    ]
+
+
+@router.delete("/{recording_id}")
+def delete_recording(
+    recording_id: int,
+    current_user: CurrentUser = Depends(require_role("admin")),
+):
+    manager = get_manager()
+    if manager is None:
+        raise HTTPException(status_code=503, detail="Recording system not initialized")
+    success = manager.delete_recording(recording_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    return {"status": "deleted"}

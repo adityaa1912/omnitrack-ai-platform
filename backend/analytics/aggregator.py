@@ -196,9 +196,10 @@ class _StreamAgg:
 
         # Object counts: class_name -> count of OBJECT_APPEARED events
         self._object_counts: Dict[str, int] = defaultdict(int)
-        # Unique tracks seen: track_id -> class_name
+        # Unique active tracks: track_id -> class_name (preserved across flush)
         self._tracks: Dict[int, str] = {}
-        # Zone occupancy: zone_name -> {track_id: enter_time}
+        # Zone occupancy: zone_name -> {track_id: enter_time} (active membership,
+        # preserved across flush so in-zone tracks survive window rotation)
         self._zone_tracks: Dict[str, Dict[int, float]] = defaultdict(dict)
         # Zone counters: zone_name -> {entries, exits, occupancy_seconds}
         self._zone_stats: Dict[str, Dict[str, Any]] = {}
@@ -215,34 +216,41 @@ class _StreamAgg:
         self._track_enter_time: Dict[int, float] = {}
         # Window start for current aggregation
         self._window_start: datetime = datetime.now(timezone.utc)
+        # Serializes per-stream mutation and flush so concurrent ingestion never
+        # corrupts a flush in progress and data is retained exactly once.
+        self._lock = threading.Lock()
 
     def handle_event(self, record: dict) -> None:
+        with self._lock:
+            self._handle_event_locked(record)
+
+    def _handle_event_locked(self, record: dict) -> None:
         event_type = record.get("event_type", "")
         track_id = record.get("track_id")
         class_name = record.get("class_name")
         metadata = record.get("metadata", {})
         timestamp = record.get("timestamp", time.time())
 
-        if event_type == "OBJECT_APPEARED":
+        if event_type == "object_appeared":
             self._object_counts[class_name or "unknown"] += 1
             if track_id is not None:
                 self._tracks[track_id] = class_name or "unknown"
 
-        elif event_type == "OBJECT_DISAPPEARED":
+        elif event_type == "object_disappeared":
             if track_id is not None:
                 self._tracks.pop(track_id, None)
             if self._snapshot_on_disappear and track_id is not None:
                 self._snapshot_trajectory(track_id, timestamp)
 
-        elif event_type == "OBJECT_ENTERED":
-            zone_name = metadata.get("zone_name", "unknown")
+        elif event_type == "object_entered":
+            zone_name = metadata.get("zone", "unknown")
             if track_id is not None:
                 self._zone_tracks[zone_name][track_id] = timestamp
                 self._ensure_zone_stats(zone_name)
                 self._zone_stats[zone_name]["entries"] += 1
 
-        elif event_type == "OBJECT_EXITED":
-            zone_name = metadata.get("zone_name", "unknown")
+        elif event_type == "object_exited":
+            zone_name = metadata.get("zone", "unknown")
             if track_id is not None:
                 enter_time = self._zone_tracks[zone_name].pop(track_id, timestamp)
                 dwell = max(timestamp - enter_time, 0.0)
@@ -251,10 +259,13 @@ class _StreamAgg:
                 self._zone_stats[zone_name]["exits"] += 1
                 self._zone_stats[zone_name]["occupancy_seconds"] += dwell
 
-        elif event_type == "CROSSING_DIRECTION":
-            line_name = metadata.get("line_name", "unknown")
+        elif event_type == "crossing_direction":
+            line_name = metadata.get("line", "unknown")
             direction = metadata.get("direction", "")
             self._ensure_line_stats(line_name)
+            # ``direction`` is the label the producer resolved (e.g. "positive"/"negative"
+            # or custom labels such as "in"/"out"). Bucket against the line's positive
+            # label, defaulting to "positive" for backwards compatibility.
             if direction == metadata.get("positive_label", "positive"):
                 self._line_stats[line_name]["positive"] += 1
             else:
@@ -262,8 +273,8 @@ class _StreamAgg:
             if track_id is not None:
                 self._line_stats[line_name]["tracks"].add(track_id)
 
-        elif event_type == "DWELL_TIME":
-            zone_name = metadata.get("zone_name", "unknown")
+        elif event_type == "dwell_time":
+            zone_name = metadata.get("zone", "unknown")
             seconds = metadata.get("seconds", 0.0)
             self._dwell_time_total += seconds
             self._ensure_zone_stats(zone_name)
@@ -298,83 +309,92 @@ class _StreamAgg:
         pass  # Trajectory snapshots are flushed in flush()
 
     def flush(self, session_factory) -> None:
-        """Persist current window state to PostgreSQL."""
-        session = session_factory()
-        try:
+        """Persist current window state to PostgreSQL.
+
+        ``session_factory`` is a callable returning a fresh SQLAlchemy session.
+        Active track/zone membership is preserved across the flush so occupancy
+        and dwell continue correctly into the next window; only window-scoped
+        counters are reset.
+        """
+        with self._lock:
             now = datetime.now(timezone.utc)
             window_start = self._window_start
             window_end = now
 
-            # AnalyticsSummary
-            for class_name, count in self._object_counts.items():
-                summary = AnalyticsSummary(
-                    stream_id=self.stream_id,
-                    time_window_start=window_start,
-                    time_window_end=window_end,
-                    class_name=class_name,
-                    object_count=count,
-                    unique_tracks=len(self._tracks),
-                    zone_entry_count=sum(
-                        z["entries"] for z in self._zone_stats.values()
-                    ),
-                    zone_exit_count=sum(
-                        z["exits"] for z in self._zone_stats.values()
-                    ),
-                    zone_occupancy_seconds=sum(
-                        z["occupancy_seconds"]
-                        for z in self._zone_stats.values()
-                    ),
-                    dwell_time_total_seconds=self._dwell_time_total,
-                    stationary_events=self._stationary_count,
-                    near_collision_events=self._near_collision_count,
+            session = session_factory()
+            try:
+                # AnalyticsSummary
+                for class_name, count in self._object_counts.items():
+                    summary = AnalyticsSummary(
+                        stream_id=self.stream_id,
+                        time_window_start=window_start,
+                        time_window_end=window_end,
+                        class_name=class_name,
+                        object_count=count,
+                        unique_tracks=len(self._tracks),
+                        zone_entry_count=sum(
+                            z["entries"] for z in self._zone_stats.values()
+                        ),
+                        zone_exit_count=sum(
+                            z["exits"] for z in self._zone_stats.values()
+                        ),
+                        zone_occupancy_seconds=sum(
+                            z["occupancy_seconds"]
+                            for z in self._zone_stats.values()
+                        ),
+                        dwell_time_total_seconds=self._dwell_time_total,
+                        stationary_events=self._stationary_count,
+                        near_collision_events=self._near_collision_count,
+                    )
+                    session.add(summary)
+
+                # ZoneOccupancy
+                for zone_name, stats in self._zone_stats.items():
+                    occupancy = ZoneOccupancy(
+                        stream_id=self.stream_id,
+                        zone_name=zone_name,
+                        time_window_start=window_start,
+                        time_window_end=window_end,
+                        entry_count=stats["entries"],
+                        exit_count=stats["exits"],
+                        unique_tracks=len(stats["unique_tracks"]),
+                        total_occupancy_seconds=stats["occupancy_seconds"],
+                    )
+                    session.add(occupancy)
+
+                # LineCrossing
+                for line_name, stats in self._line_stats.items():
+                    crossing = LineCrossing(
+                        stream_id=self.stream_id,
+                        line_name=line_name,
+                        time_window_start=window_start,
+                        time_window_end=window_end,
+                        positive_count=stats["positive"],
+                        negative_count=stats["negative"],
+                        unique_tracks=len(stats["tracks"]),
+                    )
+                    session.add(crossing)
+
+                session.commit()
+                om.ANALYTICS_SUMMARIES_FLUSHED.inc()
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                # Keep in-memory data intact on failure so a retry flush counts
+                # data exactly once rather than losing it.
+                logger.warning(
+                    f"Analytics flush failed for {self.stream_id}: {exc}"
                 )
-                session.add(summary)
+                return
+            finally:
+                session.close()
 
-            # ZoneOccupancy
-            for zone_name, stats in self._zone_stats.items():
-                occupancy = ZoneOccupancy(
-                    stream_id=self.stream_id,
-                    zone_name=zone_name,
-                    time_window_start=window_start,
-                    time_window_end=window_end,
-                    entry_count=stats["entries"],
-                    exit_count=stats["exits"],
-                    unique_tracks=len(stats["unique_tracks"]),
-                    total_occupancy_seconds=stats["occupancy_seconds"],
-                )
-                session.add(occupancy)
-
-            # LineCrossing
-            for line_name, stats in self._line_stats.items():
-                crossing = LineCrossing(
-                    stream_id=self.stream_id,
-                    line_name=line_name,
-                    time_window_start=window_start,
-                    time_window_end=window_end,
-                    positive_count=stats["positive"],
-                    negative_count=stats["negative"],
-                    unique_tracks=len(stats["tracks"]),
-                )
-                session.add(crossing)
-
-            session.commit()
-            om.ANALYTICS_SUMMARIES_FLUSHED.inc()
-        except Exception as exc:  # noqa: BLE001
-            session.rollback()
-            logger.warning(
-                f"Analytics flush failed for {self.stream_id}: {exc}"
-            )
-        finally:
-            session.close()
-
-        # Reset window state
+        # Reset window-scoped counters only. Active track and zone membership is
+        # preserved so occupancy/dwell continue correctly into the next window and
+        # tracks still present at flush time are not dropped.
         self._window_start = now
         self._object_counts.clear()
-        self._tracks.clear()
-        self._zone_tracks.clear()
         self._zone_stats.clear()
         self._line_stats.clear()
-        self._dwell_time_total = 0.0
         self._stationary_count = 0
         self._near_collision_count = 0
 
