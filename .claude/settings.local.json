@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import cv2\")",
+      "Bash(venv/Scripts/python -c \"import cv2; print\\('cv2 ok'\\)\")",
+      "Bash(venv/Scripts/python -c \"from backend.analytics import router as ar; print\\('module:', ar.__name__\\); print\\('set_manager:', hasattr\\(ar,'set_manager'\\)\\); print\\('router:', hasattr\\(ar,'router'\\)\\)\")",
+      "Bash(venv/Scripts/python -m pytest tests/test_analytics.py -q)",
+      "Bash(venv/Scripts/python -m pytest -q)",
+      "Bash(git stash *)",
+      "Bash(venv/Scripts/python -m pytest tests/test_auth.py::TestRBAC::test_viewer_cannot_start_stream tests/test_observability.py::test_diagnostics_rejects_viewer -q)",
+      "Bash(venv/Scripts/python -m pytest tests/test_observability.py::test_diagnostics_rejects_viewer tests/test_auth.py::TestRBAC::test_viewer_cannot_start_stream -v)",
+      "Bash(venv/Scripts/python -c \"import backend.settings as s; import inspect; print\\(inspect.getsource\\(s.get_settings\\)\\)\")",
+      "Bash(venv/Scripts/python -m pytest tests/ -p no:cacheprovider -rf)",
+      "Bash(venv/Scripts/python -m pytest tests/ -p no:cacheprovider)",
+      "Bash(echo \"exit $?\")",
+      "Read(//tmp/**)",
+      "Bash(venv/Scripts/python -m pytest -p no:cacheprovider -rA)",
+      "Bash(venv/Scripts/python -m pytest -p no:cacheprovider tests/test_auth.py::TestRBAC::test_viewer_cannot_start_stream tests/test_alerts.py -rA)",
+      "Bash(grep -aA8 \"def test_viewer_cannot_start_stream\")",
+      "Bash(venv/Scripts/python -m pytest -p no:cacheprovider tests/test_auth.py tests/test_observability.py)"
+    ]
+  }
+}

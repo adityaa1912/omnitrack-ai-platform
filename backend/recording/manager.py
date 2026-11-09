@@ -175,6 +175,8 @@ class RecordingManager:
                 if oldest is None:
                     break
                 try:
+                    full_path = self._storage._full_path(oldest.file_path)
+                    size_bytes = os.path.getsize(full_path) if os.path.exists(full_path) else 0
                     self._storage.delete(oldest.file_path)
                     for snap in oldest.snapshots:
                         self._storage.delete(snap.file_path)
@@ -182,7 +184,7 @@ class RecordingManager:
                         self._storage.delete(ev.file_path)
                     self._db.delete(oldest)
                     self._db.commit()
-                    total_size -= os.path.getsize(oldest.file_path) if os.path.exists(self._storage._full_path(oldest.file_path)) else 0
+                    total_size -= size_bytes
                     om.RECORDINGS_DELETED_TOTAL.inc()
                 except Exception as exc:  # noqa: BLE001
                     self._db.rollback()
