@@ -1,4 +1,7 @@
 # Distributed Real-Time Object Tracking & Anomaly Detection System
+
+> **This document is aspirational architecture only.** It is not an inventory of implemented infrastructure, and its metrics/SLOs are design targets, not measured results. Actual implementation: local centroid tracking, SQLite default, OpenCV GUI + FastAPI backend, React UI, optional Redis/Kafka/Postgres behind flags. See `CLAUDE.md` for current runtime contracts.
+
 ## PHASE 1 & PHASE 2 - Enterprise Architecture Design
 
 ---

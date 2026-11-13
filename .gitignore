@@ -24,3 +24,4 @@ scripts/perf/results/*.json
 
 # GSD Planning
 .planning/
+CLAUDE.md

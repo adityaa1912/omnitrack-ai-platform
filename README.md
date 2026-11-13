@@ -201,7 +201,7 @@ The platform can function as:
 omnitrack-ai-platform/
 │
 ├── backend/
-│   ├── app.py
+│   ├── main.py
 │   ├── service.py
 │   ├── models.py
 │   └── run.py
